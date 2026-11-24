@@ -1,16 +1,33 @@
 diff --git a/ggml/src/ggml-hexagon/ggml-hexagon.cpp b/ggml/src/ggml-hexagon/ggml-hexagon.cpp
-index c38d0005c..80d6942d7 100644
+index c38d0005c..82b202497 100644
 --- a/ggml/src/ggml-hexagon/ggml-hexagon.cpp
 +++ b/ggml/src/ggml-hexagon/ggml-hexagon.cpp
-@@ -137,6 +137,7 @@ int    opt_fa_select     = 2; // 2 = HMX -> HVX -> CPU, 1 = HVX -> CPU, 0 = CPU
+@@ -137,6 +137,8 @@ int    opt_fa_select     = 2; // 2 = HMX -> HVX -> CPU, 1 = HVX -> CPU, 0 = CPU
  int    opt_fa_split      = 1; // 1 = head-split + team-split when n_kv_heads < N_cores (default), 0 = off
  int    opt_li_select     = 2; // 2 = HMX -> HVX, 1 = HVX, 0 = CPU (unsupported)
  int    opt_gdn_select    = 2; // 2 = HMX -> HVX, 1 = HVX, 0 = CPU (unsupported)
 +int    opt_gdn_fold      = 1; // decode-time GDN folds: 1 = state-direct + gates, 0 = off (GGML_HEXAGON_GDN_FOLD)
++int    opt_conv_fold     = 1; // decode-time direct ssm-conv fold (CONCAT+CPY+SSM_CONV[+SILU]), 0 = off (GGML_HEXAGON_CONV_FOLD)
  int    opt_ar_select     = 2; // 2 = fused ALLREDUCE+ADD (default), 1 = unfused ALLREDUCE, 0 = fallback to CPY+FENCE
  int    opt_ar_scatter    = 1; // 1 = reduce-scatter the fused ALLREDUCE+ADD (default), 0 = full reduction
  
-@@ -2440,6 +2441,315 @@ static void ggml_hexagon_graph_repack(const ggml_cgraph * graph, ggml_hexagon_se
+@@ -166,6 +168,15 @@ static const char * status_to_str(uint32_t status) {
+             return "VTCM-TOO-SMALL";
+         case HTP_STATUS_INTERNAL_ERR:
+             return "INTERNAL-ERROR";
++        case HTP_STATUS_CONV_NHVX:    return "CONV-NHVX";
++        case HTP_STATUS_CONV_VTCM:    return "CONV-VTCM";
++        case HTP_STATUS_CONV_T0:      return "CONV-T0-X";
++        case HTP_STATUS_CONV_T1:      return "CONV-T1-OLD";
++        case HTP_STATUS_CONV_T2:      return "CONV-T2-W";
++        case HTP_STATUS_CONV_T3:      return "CONV-T3-NEXT";
++        case HTP_STATUS_CONV_T4:      return "CONV-T4-Y";
++        case HTP_STATUS_CONV_WEIGHT:  return "CONV-WEIGHT-OUT";
++        case HTP_STATUS_CONV_OVERLAP: return "CONV-OVERLAP";
+         default:
+             return "UNKNOWN";
+     }
+@@ -2440,6 +2451,321 @@ static void ggml_hexagon_graph_repack(const ggml_cgraph * graph, ggml_hexagon_se
      }
  }
  
@@ -202,7 +219,7 @@ index c38d0005c..80d6942d7 100644
 +
 +static void htp_conv_prepass(const ggml_cgraph * graph, const ggml_hexagon_session * sess,
 +                             std::vector<char> & folded, std::unordered_map<const ggml_tensor *, htp_conv_fold> & folds) {
-+    if (!opt_gdn_fold) return;
++    if (!opt_conv_fold) return;
 +
 +    const int n = graph->n_nodes;
 +    std::unordered_map<const ggml_tensor *, int> index;
@@ -278,6 +295,12 @@ index c38d0005c..80d6942d7 100644
 +            }
 +        }
 +        if (!clean) continue;
++        if (htp_conv_ranges_overlap(f.next, old) || htp_conv_ranges_overlap(f.next, x) || htp_conv_ranges_overlap(f.next, w) ||
++            htp_conv_ranges_overlap(y, old) || htp_conv_ranges_overlap(y, x) || htp_conv_ranges_overlap(y, w) ||
++            htp_conv_ranges_overlap(y, f.next)) {
++            HEX_VERBOSE("ggml-hex: %s conv-fold skip %s: output overlaps an input\n", sess->c_name(), y->name);
++            continue;
++        }
 +
 +        // optional SiLU on y
 +        f.y_out = y;
@@ -326,7 +349,7 @@ index c38d0005c..80d6942d7 100644
  static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, ggml_cgraph * graph) {
      auto sess = static_cast<ggml_hexagon_session *>(backend->context);
  
-@@ -2462,9 +2772,15 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
+@@ -2462,9 +2788,15 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
  
          computed_nodes.reserve(graph->n_nodes);
  
@@ -343,7 +366,7 @@ index c38d0005c..80d6942d7 100644
                  continue;
              }
  
-@@ -2476,6 +2792,25 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
+@@ -2476,6 +2808,25 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
              htp_opnode node(opcode, n);
              GGML_ASSERT(htp_kparams_solve(sess, node));
  
@@ -369,31 +392,34 @@ index c38d0005c..80d6942d7 100644
              computed_nodes.push_back(std::move(node));
          }
  
-@@ -3468,6 +3803,7 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
+@@ -3468,6 +3819,8 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
      const char * str_fa_split  = getenv("GGML_HEXAGON_FA_SPLIT");
      const char * str_li_select = getenv("GGML_HEXAGON_LI_SELECT");
      const char * str_gdn_select = getenv("GGML_HEXAGON_GDN_SELECT");
 +    const char * str_gdn_fold = getenv("GGML_HEXAGON_GDN_FOLD");
++    const char * str_conv_fold = getenv("GGML_HEXAGON_CONV_FOLD");
      const char * str_ar_select = getenv("GGML_HEXAGON_AR_SELECT");
      const char * str_ar_scatter = getenv("GGML_HEXAGON_AR_SCATTER");
      const char * str_ndev     = getenv("GGML_HEXAGON_NDEV");
-@@ -3535,6 +3871,7 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
+@@ -3535,6 +3888,8 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
      opt_fa_split  = str_fa_split  ? atoi(str_fa_split)                   : opt_fa_split;
      opt_li_select = str_li_select ? atoi(str_li_select)                   : opt_li_select;
      opt_gdn_select    = str_gdn_select    ? atoi(str_gdn_select)          : opt_gdn_select;
 +    opt_gdn_fold      = str_gdn_fold      ? atoi(str_gdn_fold)            : opt_gdn_fold;
++    opt_conv_fold     = str_conv_fold     ? atoi(str_conv_fold)           : opt_conv_fold;
      opt_ar_select     = str_ar_select     ? atoi(str_ar_select)           : opt_ar_select;
      opt_ar_scatter    = str_ar_scatter    ? atoi(str_ar_scatter)          : opt_ar_scatter;
  
 diff --git a/ggml/src/ggml-hexagon/htp-common.h b/ggml/src/ggml-hexagon/htp-common.h
-index 4e9e54415..746eeb86b 100644
+index 4e9e54415..8f63c9116 100644
 --- a/ggml/src/ggml-hexagon/htp-common.h
 +++ b/ggml/src/ggml-hexagon/htp-common.h
-@@ -25,6 +25,7 @@ extern int    opt_fa_select;
+@@ -25,6 +25,8 @@ extern int    opt_fa_select;
  extern int    opt_fa_split;
  extern int    opt_li_select;
  extern int    opt_gdn_select;
 +extern int    opt_gdn_fold;
++extern int    opt_conv_fold;
  extern int    opt_ar_select;
  extern int    opt_ar_scatter;
  
@@ -565,6 +591,27 @@ index aff1eb645..88129cbab 100644
  
      struct fastdiv_values div_H;
      struct fastdiv_values div_q1;
+diff --git a/ggml/src/ggml-hexagon/htp/htp-ops.h b/ggml/src/ggml-hexagon/htp/htp-ops.h
+index 7c4b97307..b7f40a729 100644
+--- a/ggml/src/ggml-hexagon/htp/htp-ops.h
++++ b/ggml/src/ggml-hexagon/htp/htp-ops.h
+@@ -11,6 +11,16 @@ enum htp_status {
+     HTP_STATUS_NO_SUPPORT     = 3,
+     HTP_STATUS_INVAL_PARAMS   = 4,
+     HTP_STATUS_VTCM_TOO_SMALL = 5,
++    // direct ssm-conv (decode fold) parameter checks, reported by name on the host for on-device diagnosis
++    HTP_STATUS_CONV_NHVX      = 16,
++    HTP_STATUS_CONV_VTCM      = 17,
++    HTP_STATUS_CONV_T0        = 18,   // x
++    HTP_STATUS_CONV_T1        = 19,   // old state
++    HTP_STATUS_CONV_T2        = 20,   // weight
++    HTP_STATUS_CONV_T3        = 21,   // next state
++    HTP_STATUS_CONV_T4        = 22,   // y
++    HTP_STATUS_CONV_WEIGHT    = 23,
++    HTP_STATUS_CONV_OVERLAP   = 24,
+ };
+ 
+ // First set of values must match the ggml_type.
 diff --git a/ggml/src/ggml-hexagon/htp/qedge_prefill4/LICENSE.llama.cpp b/ggml/src/ggml-hexagon/htp/qedge_prefill4/LICENSE.llama.cpp
 new file mode 100644
 index 000000000..e7dca554b
@@ -729,7 +776,7 @@ index 000000000..7a261bb26
 +
 +#endif
 diff --git a/ggml/src/ggml-hexagon/htp/ssm-conv.c b/ggml/src/ggml-hexagon/htp/ssm-conv.c
-index d75304fef..17121802d 100644
+index d75304fef..aafcde8b7 100644
 --- a/ggml/src/ggml-hexagon/htp/ssm-conv.c
 +++ b/ggml/src/ggml-hexagon/htp/ssm-conv.c
 @@ -20,6 +20,8 @@
@@ -741,7 +788,7 @@ index d75304fef..17121802d 100644
  
  struct htp_ssm_conv_context {
      struct htp_ops_context *                  octx;
-@@ -634,7 +636,132 @@ int op_ssm_conv_f32(struct htp_ops_context * octx) {
+@@ -634,7 +636,133 @@ int op_ssm_conv_f32(struct htp_ops_context * octx) {
      return HTP_STATUS_OK;
  }
  
@@ -830,27 +877,28 @@ index d75304fef..17121802d 100644
 +        return HTP_STATUS_NO_SUPPORT;
 +    }
 +    if (!htp_ops_context_set_n_hvx(octx, kp->n_hvx)) {
-+        return HTP_STATUS_INVAL_PARAMS;
++        return HTP_STATUS_CONV_NHVX;
 +    }
 +    const uint32_t n_hvx = octx->n_hvx;
 +    const uint32_t per_thread_bytes = htp_ssm_direct_vtcm_bytes_per_thread(tokens);
 +    const uint64_t bytes = (uint64_t) per_thread_bytes * n_hvx;
 +    if (n_hvx == 0 || n_hvx > HTP_OP_MAX_NTHREADS || kp->vtcm_size != bytes) {
-+        return HTP_STATUS_INVAL_PARAMS;
++        return HTP_STATUS_CONV_VTCM;
 +    }
 +    if (ctx->vtcm_size < bytes || !ctx->vtcm_base || ((uintptr_t) ctx->vtcm_base & 127u)) {
 +        return HTP_STATUS_VTCM_TOO_SMALL;
 +    }
 +    const struct htp_tensor * ts[] = { octx->src[0], octx->src[1], octx->src[2], octx->dsts[0], octx->dsts[1] };
-+    if (!ssm_direct_tensor_ok(ctx, ts[0], channels, tokens) || !ssm_direct_tensor_ok(ctx, ts[1], 3, channels) ||
-+        !ssm_direct_tensor_ok(ctx, ts[2], 4, channels) || !ssm_direct_tensor_ok(ctx, ts[3], 3 * channels, 1) ||
-+        !ssm_direct_tensor_ok(ctx, ts[4], channels, tokens) || ((ts[3]->flags | ts[4]->flags) & HTP_TENSOR_WEIGHT)) {
-+        return HTP_STATUS_INVAL_PARAMS;
-+    }
++    if (!ssm_direct_tensor_ok(ctx, ts[0], channels, tokens)) return HTP_STATUS_CONV_T0;
++    if (!ssm_direct_tensor_ok(ctx, ts[1], 3, channels))      return HTP_STATUS_CONV_T1;
++    if (!ssm_direct_tensor_ok(ctx, ts[2], 4, channels))      return HTP_STATUS_CONV_T2;
++    if (!ssm_direct_tensor_ok(ctx, ts[3], 3 * channels, 1))  return HTP_STATUS_CONV_T3;
++    if (!ssm_direct_tensor_ok(ctx, ts[4], channels, tokens)) return HTP_STATUS_CONV_T4;
++    if ((ts[3]->flags | ts[4]->flags) & HTP_TENSOR_WEIGHT)   return HTP_STATUS_CONV_WEIGHT;
 +    for (int i = 3; i < 5; ++i) {
 +        for (int j = 0; j < i; ++j) {
 +            if (ts[i]->data < ts[j]->data + ts[j]->size && ts[j]->data < ts[i]->data + ts[i]->size) {
-+                return HTP_STATUS_INVAL_PARAMS;
++                return HTP_STATUS_CONV_OVERLAP;
 +            }
 +        }
 +    }
