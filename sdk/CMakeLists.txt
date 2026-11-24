@@ -2,6 +2,12 @@ cmake_minimum_required(VERSION 3.16)
 # C compiler is required by native dependencies.
 project(geniex C CXX)
 
+# Cold Windows builds (no restored cargo cache) link the Rust tokenizers static lib against the
+# runner's current std, which needs WaitOnAddress/WakeByAddress* from synchronization.lib.
+if(WIN32)
+    link_libraries(synchronization)
+endif()
+
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED true)
 set(CMAKE_CXX_STANDARD 17)
