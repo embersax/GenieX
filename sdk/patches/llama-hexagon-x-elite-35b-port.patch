@@ -624,7 +624,7 @@ index 7c4b97307..b7f40a729 100644
  
  // First set of values must match the ggml_type.
 diff --git a/ggml/src/ggml-hexagon/htp/matmul-ops.c b/ggml/src/ggml-hexagon/htp/matmul-ops.c
-index fb15310cf..5a47f963a 100644
+index fb15310cf..e7d57f7a1 100644
 --- a/ggml/src/ggml-hexagon/htp/matmul-ops.c
 +++ b/ggml/src/ggml-hexagon/htp/matmul-ops.c
 @@ -1380,11 +1380,120 @@ static void hvx_mm_id_tiled(const htp_thread_t * th, unsigned int nth, unsigned
@@ -689,12 +689,12 @@ index fb15310cf..5a47f963a 100644
 +    #define HTP_MVID_PUSH(slot_ptr, out_gt)                                                                          \
 +        do {                                                                                                         \
 +            const struct htp_mvid_seg * sg = &segs[p_seg];                                                           \
-+            uint32_t gt = sg->ct_end - p_ct;                                                                         \
-+            if (gt > group) gt = group;                                                                              \
++            uint32_t gt_ = sg->ct_end - p_ct;                                                                         \
++            if (gt_ > group) gt_ = group;                                                                              \
 +            dma_queue_push(dma_q, dma_make_data((slot_ptr), sg->src0_row + (dma_addr_t) p_ct * sg->tile_row_stride),  \
-+                           sg->aligned_tile_size, sg->tile_size, sg->tile_size, (size_t) gt * sg->n_k_tiles_w);      \
-+            (out_gt) = gt;                                                                                           \
-+            p_ct += gt;                                                                                              \
++                           sg->aligned_tile_size, sg->tile_size, sg->tile_size, (size_t) gt_ * sg->n_k_tiles_w);      \
++            (out_gt) = gt_;                                                                                           \
++            p_ct += gt_;                                                                                              \
 +            if (p_ct >= sg->ct_end) {                                                                                \
 +                p_seg++;                                                                                             \
 +                while (p_seg < n_seg && htp_mvid_seg_tiles(&segs[p_seg]) == 0) p_seg++;                              \
@@ -709,7 +709,7 @@ index fb15310cf..5a47f963a 100644
 +    for (uint32_t g = 0; g < n_groups_ring && p_seg < n_seg; g++) {
 +        uint8_t * slot = vtcm_base + (size_t) g * group * slot_stride;
 +        const uint32_t seg = p_seg, ct = p_ct;
-+        uint32_t gt;
++        uint32_t gt = 0;
 +        HTP_MVID_PUSH(slot, gt);
 +        inflight[(head + n_inflight) % HTP_MM_MAX_PREFETCH] = (struct htp_mvid_inflight) { seg, ct, gt, slot };
 +        n_inflight++;
@@ -733,7 +733,7 @@ index fb15310cf..5a47f963a 100644
 +        }
 +        if (p_seg < n_seg) {
 +            const uint32_t seg = p_seg, ct = p_ct;
-+            uint32_t gt;
++            uint32_t gt = 0;
 +            HTP_MVID_PUSH(cur.slot, gt);
 +            inflight[(head + n_inflight) % HTP_MM_MAX_PREFETCH] = (struct htp_mvid_inflight) { seg, ct, gt, cur.slot };
 +            n_inflight++;
