@@ -1,5 +1,5 @@
 diff --git a/ggml/src/ggml-hexagon/ggml-hexagon.cpp b/ggml/src/ggml-hexagon/ggml-hexagon.cpp
-index c38d0005c..0fdc92968 100644
+index c38d0005c..d5042ddef 100644
 --- a/ggml/src/ggml-hexagon/ggml-hexagon.cpp
 +++ b/ggml/src/ggml-hexagon/ggml-hexagon.cpp
 @@ -137,6 +137,8 @@ int    opt_fa_select     = 2; // 2 = HMX -> HVX -> CPU, 1 = HVX -> CPU, 0 = CPU
@@ -27,7 +27,7 @@ index c38d0005c..0fdc92968 100644
          default:
              return "UNKNOWN";
      }
-@@ -2440,6 +2451,327 @@ static void ggml_hexagon_graph_repack(const ggml_cgraph * graph, ggml_hexagon_se
+@@ -2440,6 +2451,332 @@ static void ggml_hexagon_graph_repack(const ggml_cgraph * graph, ggml_hexagon_se
      }
  }
  
@@ -301,9 +301,13 @@ index c38d0005c..0fdc92968 100644
 +            }
 +        }
 +        if (!clean) continue;
++        // y may alias x exactly (ggml-alloc reuses x's bytes; the kernel reads each x slice before writing its y slice)
++        auto same_bytes = [](const ggml_tensor * a, const ggml_tensor * b) {
++            return a->data == b->data && ggml_nbytes(a) == ggml_nbytes(b);
++        };
 +        if (htp_conv_ranges_overlap(f.next, old) || htp_conv_ranges_overlap(f.next, x) || htp_conv_ranges_overlap(f.next, w) ||
-+            htp_conv_ranges_overlap(y, old) || htp_conv_ranges_overlap(y, x) || htp_conv_ranges_overlap(y, w) ||
-+            htp_conv_ranges_overlap(y, f.next)) {
++            htp_conv_ranges_overlap(y, old) || (htp_conv_ranges_overlap(y, x) && !same_bytes(y, x)) ||
++            htp_conv_ranges_overlap(y, w) || htp_conv_ranges_overlap(y, f.next)) {
 +            HEX_VERBOSE("ggml-hex: %s conv-fold skip %s: output overlaps an input\n", sess->c_name(), y->name);
 +            continue;
 +        }
@@ -315,7 +319,8 @@ index c38d0005c..0fdc92968 100644
 +                const ggml_tensor * sn = graph->nodes[k];
 +                if (sn->op == GGML_OP_UNARY && ggml_get_unary_op(sn) == GGML_UNARY_OP_SILU && sn->src[0] == y &&
 +                    ggml_hexagon_op_is_compute(sn) && ggml_are_same_layout(y, sn) && htp_gdn_tensor_local(sn) &&
-+                    ((reinterpret_cast<uintptr_t>(sn->data) & 127) == 0) && !htp_conv_ranges_overlap(sn, x) &&
++                    ((reinterpret_cast<uintptr_t>(sn->data) & 127) == 0) &&
++                    (!htp_conv_ranges_overlap(sn, x) || same_bytes(sn, x)) && !htp_conv_ranges_overlap(sn, w) &&
 +                    !htp_conv_ranges_overlap(sn, old) && !htp_conv_ranges_overlap(sn, f.next)) {
 +                    f.silu  = sn;
 +                    f.y_out = sn;
@@ -355,7 +360,7 @@ index c38d0005c..0fdc92968 100644
  static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, ggml_cgraph * graph) {
      auto sess = static_cast<ggml_hexagon_session *>(backend->context);
  
-@@ -2462,9 +2794,15 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
+@@ -2462,9 +2799,15 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
  
          computed_nodes.reserve(graph->n_nodes);
  
@@ -372,7 +377,7 @@ index c38d0005c..0fdc92968 100644
                  continue;
              }
  
-@@ -2476,6 +2814,25 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
+@@ -2476,6 +2819,25 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
              htp_opnode node(opcode, n);
              GGML_ASSERT(htp_kparams_solve(sess, node));
  
@@ -398,7 +403,7 @@ index c38d0005c..0fdc92968 100644
              computed_nodes.push_back(std::move(node));
          }
  
-@@ -3468,6 +3825,8 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
+@@ -3468,6 +3830,8 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
      const char * str_fa_split  = getenv("GGML_HEXAGON_FA_SPLIT");
      const char * str_li_select = getenv("GGML_HEXAGON_LI_SELECT");
      const char * str_gdn_select = getenv("GGML_HEXAGON_GDN_SELECT");
@@ -407,7 +412,7 @@ index c38d0005c..0fdc92968 100644
      const char * str_ar_select = getenv("GGML_HEXAGON_AR_SELECT");
      const char * str_ar_scatter = getenv("GGML_HEXAGON_AR_SCATTER");
      const char * str_ndev     = getenv("GGML_HEXAGON_NDEV");
-@@ -3535,6 +3894,8 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
+@@ -3535,6 +3899,8 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
      opt_fa_split  = str_fa_split  ? atoi(str_fa_split)                   : opt_fa_split;
      opt_li_select = str_li_select ? atoi(str_li_select)                   : opt_li_select;
      opt_gdn_select    = str_gdn_select    ? atoi(str_gdn_select)          : opt_gdn_select;
@@ -782,7 +787,7 @@ index 000000000..7a261bb26
 +
 +#endif
 diff --git a/ggml/src/ggml-hexagon/htp/ssm-conv.c b/ggml/src/ggml-hexagon/htp/ssm-conv.c
-index d75304fef..aafcde8b7 100644
+index d75304fef..9fab6897f 100644
 --- a/ggml/src/ggml-hexagon/htp/ssm-conv.c
 +++ b/ggml/src/ggml-hexagon/htp/ssm-conv.c
 @@ -20,6 +20,8 @@
@@ -794,7 +799,7 @@ index d75304fef..aafcde8b7 100644
  
  struct htp_ssm_conv_context {
      struct htp_ops_context *                  octx;
-@@ -634,7 +636,133 @@ int op_ssm_conv_f32(struct htp_ops_context * octx) {
+@@ -634,7 +636,136 @@ int op_ssm_conv_f32(struct htp_ops_context * octx) {
      return HTP_STATUS_OK;
  }
  
@@ -901,8 +906,11 @@ index d75304fef..aafcde8b7 100644
 +    if (!ssm_direct_tensor_ok(ctx, ts[3], 3 * channels, 1))  return HTP_STATUS_CONV_T3;
 +    if (!ssm_direct_tensor_ok(ctx, ts[4], channels, tokens)) return HTP_STATUS_CONV_T4;
 +    if ((ts[3]->flags | ts[4]->flags) & HTP_TENSOR_WEIGHT)   return HTP_STATUS_CONV_WEIGHT;
++    // outputs must not overlap inputs, except y exactly aliasing x: ggml-alloc reuses x's bytes for the conv
++    // output, and each slice reads its x block into VTCM before its y block is written (slices are disjoint).
 +    for (int i = 3; i < 5; ++i) {
 +        for (int j = 0; j < i; ++j) {
++            if (i == 4 && j == 0 && ts[4]->data == ts[0]->data && ts[4]->size == ts[0]->size) continue;
 +            if (ts[i]->data < ts[j]->data + ts[j]->size && ts[j]->data < ts[i]->data + ts[i]->size) {
 +                return HTP_STATUS_CONV_OVERLAP;
 +            }
