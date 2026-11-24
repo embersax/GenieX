@@ -787,7 +787,7 @@ index 000000000..7a261bb26
 +
 +#endif
 diff --git a/ggml/src/ggml-hexagon/htp/ssm-conv.c b/ggml/src/ggml-hexagon/htp/ssm-conv.c
-index d75304fef..9fab6897f 100644
+index d75304fef..94c5acd65 100644
 --- a/ggml/src/ggml-hexagon/htp/ssm-conv.c
 +++ b/ggml/src/ggml-hexagon/htp/ssm-conv.c
 @@ -20,6 +20,8 @@
@@ -799,7 +799,7 @@ index d75304fef..9fab6897f 100644
  
  struct htp_ssm_conv_context {
      struct htp_ops_context *                  octx;
-@@ -634,7 +636,136 @@ int op_ssm_conv_f32(struct htp_ops_context * octx) {
+@@ -634,7 +636,135 @@ int op_ssm_conv_f32(struct htp_ops_context * octx) {
      return HTP_STATUS_OK;
  }
  
@@ -858,13 +858,12 @@ index d75304fef..9fab6897f 100644
 +        htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) c);
 +        prefill4_hvx(x, old, weight, y, next, tokens, tile);
 +        if (task->silu) {
-+            // same two routines and operand order as the stock SILU kernel, one vector at a time; the old-state
-+            // block is free once prefill4_hvx has consumed it, so it is the (VTCM) scratch vector
-+            float * silu_tmp = old;
-+            for (uint32_t i = 0; i < tokens * tile; i += 32) {
-+                hvx_sigmoid_f32_aa((uint8_t *) silu_tmp, (const uint8_t *) (y + i), 32);
-+                hvx_mul_f32_aaa((uint8_t *) (y + i), (const uint8_t *) (y + i), (const uint8_t *) silu_tmp, 32);
++            // same primitive as the stock fused SSM_CONV+SILU kernel (hvx_ssm_conv_silu_vtcm), so y is bit-identical
++            HVX_Vector * restrict vy = (HVX_Vector *) y;
++            for (uint32_t i = 0; i < (tokens * tile) / 32; ++i) {
++                vy[i] = hvx_vec_silu_f32(vy[i]);
 +            }
++        }
 +        }
 +        htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) c);
 +        if (!dma_queue_push(q, dma_make_data(octx->dsts[1]->data + off, y), octx->dsts[1]->nb[1], row, row, tokens) ||
