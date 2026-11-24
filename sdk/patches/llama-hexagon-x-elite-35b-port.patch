@@ -1,5 +1,5 @@
 diff --git a/ggml/src/ggml-hexagon/ggml-hexagon.cpp b/ggml/src/ggml-hexagon/ggml-hexagon.cpp
-index c38d0005c..82b202497 100644
+index c38d0005c..0fdc92968 100644
 --- a/ggml/src/ggml-hexagon/ggml-hexagon.cpp
 +++ b/ggml/src/ggml-hexagon/ggml-hexagon.cpp
 @@ -137,6 +137,8 @@ int    opt_fa_select     = 2; // 2 = HMX -> HVX -> CPU, 1 = HVX -> CPU, 0 = CPU
@@ -27,7 +27,7 @@ index c38d0005c..82b202497 100644
          default:
              return "UNKNOWN";
      }
-@@ -2440,6 +2451,321 @@ static void ggml_hexagon_graph_repack(const ggml_cgraph * graph, ggml_hexagon_se
+@@ -2440,6 +2451,327 @@ static void ggml_hexagon_graph_repack(const ggml_cgraph * graph, ggml_hexagon_se
      }
  }
  
@@ -157,9 +157,15 @@ index c38d0005c..82b202497 100644
 +                states->nb[1] != (size_t) states->ne[0] * sizeof(float)) break;
 +            if (idx->ne[1] != 1 || idx->ne[2] != 1 || idx->ne[3] != 1 || idx->nb[0] != sizeof(int32_t)) break;
 +            if (!htp_gdn_only_user(graph, gr, st, gdn)) break;   // zero-row extra-state copy allowed
-+            if (st != gr) {
-+                const int sti = node_index(st, gi);
-+                if (sti < 0 || !ggml_node_has_n_uses(graph, sti, 1)) break;
++            // every view/reshape between the GET_ROWS and the GDN node is read once (ggml_node_has_n_uses rejects
++            // views outright, which is why the state fold never matched)
++            {
++                bool chain_ok = true;
++                for (const ggml_tensor * x = st; x && x != gr; x = x->src[0]) {
++                    const int xi = node_index(x, gi);
++                    if (xi < 0 || ggml_node_get_use_count(graph, xi) != 1 || (x->flags & GGML_TENSOR_FLAG_OUTPUT)) { chain_ok = false; break; }
++                }
++                if (!chain_ok) break;
 +            }
 +            if (!htp_gdn_tensor_local(states) || !htp_gdn_tensor_local(idx)) break;
 +            const int64_t D = st->ne[0] * st->ne[1] * st->ne[2];
@@ -349,7 +355,7 @@ index c38d0005c..82b202497 100644
  static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, ggml_cgraph * graph) {
      auto sess = static_cast<ggml_hexagon_session *>(backend->context);
  
-@@ -2462,9 +2788,15 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
+@@ -2462,9 +2794,15 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
  
          computed_nodes.reserve(graph->n_nodes);
  
@@ -366,7 +372,7 @@ index c38d0005c..82b202497 100644
                  continue;
              }
  
-@@ -2476,6 +2808,25 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
+@@ -2476,6 +2814,25 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
              htp_opnode node(opcode, n);
              GGML_ASSERT(htp_kparams_solve(sess, node));
  
@@ -392,7 +398,7 @@ index c38d0005c..82b202497 100644
              computed_nodes.push_back(std::move(node));
          }
  
-@@ -3468,6 +3819,8 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
+@@ -3468,6 +3825,8 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
      const char * str_fa_split  = getenv("GGML_HEXAGON_FA_SPLIT");
      const char * str_li_select = getenv("GGML_HEXAGON_LI_SELECT");
      const char * str_gdn_select = getenv("GGML_HEXAGON_GDN_SELECT");
@@ -401,7 +407,7 @@ index c38d0005c..82b202497 100644
      const char * str_ar_select = getenv("GGML_HEXAGON_AR_SELECT");
      const char * str_ar_scatter = getenv("GGML_HEXAGON_AR_SCATTER");
      const char * str_ndev     = getenv("GGML_HEXAGON_NDEV");
-@@ -3535,6 +3888,8 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
+@@ -3535,6 +3894,8 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
      opt_fa_split  = str_fa_split  ? atoi(str_fa_split)                   : opt_fa_split;
      opt_li_select = str_li_select ? atoi(str_li_select)                   : opt_li_select;
      opt_gdn_select    = str_gdn_select    ? atoi(str_gdn_select)          : opt_gdn_select;
