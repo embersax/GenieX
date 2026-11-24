@@ -1,0 +1,750 @@
+diff --git a/ggml/src/ggml-hexagon/ggml-hexagon.cpp b/ggml/src/ggml-hexagon/ggml-hexagon.cpp
+index c38d0005c..c15afb4d3 100644
+--- a/ggml/src/ggml-hexagon/ggml-hexagon.cpp
++++ b/ggml/src/ggml-hexagon/ggml-hexagon.cpp
+@@ -137,6 +137,7 @@ int    opt_fa_select     = 2; // 2 = HMX -> HVX -> CPU, 1 = HVX -> CPU, 0 = CPU
+ int    opt_fa_split      = 1; // 1 = head-split + team-split when n_kv_heads < N_cores (default), 0 = off
+ int    opt_li_select     = 2; // 2 = HMX -> HVX, 1 = HVX, 0 = CPU (unsupported)
+ int    opt_gdn_select    = 2; // 2 = HMX -> HVX, 1 = HVX, 0 = CPU (unsupported)
++int    opt_gdn_fold      = 1; // decode-time GDN folds: 1 = state-direct + gates, 0 = off (GGML_HEXAGON_GDN_FOLD)
+ int    opt_ar_select     = 2; // 2 = fused ALLREDUCE+ADD (default), 1 = unfused ALLREDUCE, 0 = fallback to CPY+FENCE
+ int    opt_ar_scatter    = 1; // 1 = reduce-scatter the fused ALLREDUCE+ADD (default), 0 = full reduction
+ 
+@@ -2440,6 +2441,296 @@ static void ggml_hexagon_graph_repack(const ggml_cgraph * graph, ggml_hexagon_se
+     }
+ }
+ 
++// ---- Decode-time GATED_DELTA_NET folds (ported from the sm8750 decode fusion bundle) ----
++//  * state-direct: GET_ROWS(states, s_copy) -> (RESHAPE) -> GDN src[5] is dropped; the kernel reads the slot itself
++//  * gates: ADD(alpha, dt) -> SOFTPLUS -> MUL(A) feeding g and SIGMOID(beta_raw) feeding beta are computed in-kernel
++// Both apply only to one-token, one-sequence graphs on the HVX recurrent kernel; the dropped ops are marked in
++// `folded` and skipped by graph-compute, the GDN op node gets the extra inputs and HTP_GDN_FLAG_* bits.
++struct htp_gdn_fold {
++    const ggml_tensor * states   = nullptr;
++    const ggml_tensor * idx      = nullptr;
++    const ggml_tensor * alpha    = nullptr;
++    const ggml_tensor * beta_raw = nullptr;
++    const ggml_tensor * dt       = nullptr;
++    const ggml_tensor * A        = nullptr;
++};
++
++static const ggml_tensor * htp_gdn_unwrap_view(const ggml_tensor * t) {
++    while (t && (t->op == GGML_OP_RESHAPE || t->op == GGML_OP_VIEW || t->op == GGML_OP_PERMUTE ||
++                 t->op == GGML_OP_TRANSPOSE) && t->src[0]) {
++        t = t->src[0];
++    }
++    return t;
++}
++
++static bool htp_gdn_tensor_local(const ggml_tensor * t) {
++    return t && t->buffer && ggml_backend_buffer_is_hexagon(t->buffer);
++}
++
++static void htp_gdn_prepass(const ggml_cgraph * graph, const ggml_hexagon_session * sess,
++                            std::vector<char> & folded, std::unordered_map<const ggml_tensor *, htp_gdn_fold> & folds) {
++    if (!opt_gdn_fold) return;
++
++    const int n = graph->n_nodes;
++    std::unordered_map<const ggml_tensor *, int> index;
++    index.reserve(n);
++    for (int i = 0; i < n; i++) index[graph->nodes[i]] = i;
++
++    auto node_index = [&](const ggml_tensor * t, int before) -> int {
++        auto it = index.find(t);
++        return (it == index.end() || it->second >= before) ? -1 : it->second;
++    };
++
++    for (int gi = 0; gi < n; gi++) {
++        const ggml_tensor * gdn = graph->nodes[gi];
++        if (gdn->op != GGML_OP_GATED_DELTA_NET || !ggml_hexagon_op_is_compute(gdn)) continue;
++        const ggml_tensor * v  = gdn->src[2];
++        const ggml_tensor * g  = gdn->src[3];
++        const ggml_tensor * b  = gdn->src[4];
++        const ggml_tensor * st = gdn->src[5];
++        if (!v || !g || !b || !st) continue;
++        if (v->ne[2] != 1 || v->ne[3] != 1) continue;   // one token, one sequence
++
++        // the kernel must be the HVX recurrent, non-KDA path
++        {
++            htp_opnode probe(HTP_OP_GATED_DELTA_NET, gdn);
++            if (!htp_kparams_solve(sess, probe)) continue;
++            const auto * kp = probe.kparams<htp_gdn_kernel_params>();
++            if (kp->kernel_type != HTP_GDN_KERNEL_HVX_RECURRENT || kp->kda) continue;
++        }
++
++        htp_gdn_fold f;
++
++        // gates
++        do {
++            const int64_t H = v->ne[1];
++            if (H > 32 || g->ne[0] != 1) break;
++            const ggml_tensor * mul = htp_gdn_unwrap_view(g);
++            const ggml_tensor * sig = htp_gdn_unwrap_view(b);
++            if (!mul || mul->op != GGML_OP_MUL) break;
++            if (!sig || sig->op != GGML_OP_UNARY || ggml_get_unary_op(sig) != GGML_UNARY_OP_SIGMOID) break;
++            const ggml_tensor * sp = mul->src[0];
++            const ggml_tensor * A  = mul->src[1];
++            if (!sp || !A || sp->op != GGML_OP_UNARY || ggml_get_unary_op(sp) != GGML_UNARY_OP_SOFTPLUS) break;
++            const ggml_tensor * add = sp->src[0];
++            if (!add || add->op != GGML_OP_ADD) break;
++            const ggml_tensor * alpha = add->src[0];
++            const ggml_tensor * dt    = add->src[1];
++            const ggml_tensor * braw  = sig->src[0];
++            if (!alpha || !dt || !braw) break;
++            bool ok = true;
++            for (const ggml_tensor * t : { mul, sp, add, sig, alpha, dt, A, braw }) {
++                if (t->type != GGML_TYPE_F32 || ggml_nelements(t) != H) ok = false;
++            }
++            if (!ok) break;
++            if (dt->ne[0] != H || A->ne[0] != H || alpha->nb[0] != sizeof(float) || braw->nb[0] != sizeof(float)) break;
++            if (!(alpha->ne[0] == H || alpha->ne[1] == H) || !(braw->ne[0] == H || braw->ne[1] == H)) break;
++            if (!htp_gdn_tensor_local(alpha) || !htp_gdn_tensor_local(dt) ||
++                !htp_gdn_tensor_local(A)     || !htp_gdn_tensor_local(braw)) break;
++            const int ia = node_index(add, gi), is = node_index(sp, gi), im = node_index(mul, gi), ig = node_index(sig, gi);
++            if (ia < 0 || is < 0 || im < 0 || ig < 0) break;
++            if (!ggml_node_has_n_uses(graph, ia, 1) || !ggml_node_has_n_uses(graph, is, 1) ||
++                !ggml_node_has_n_uses(graph, im, 1) || !ggml_node_has_n_uses(graph, ig, 1)) break;
++            f.alpha = alpha; f.beta_raw = braw; f.dt = dt; f.A = A;
++            folded[ia] = folded[is] = folded[im] = folded[ig] = 1;
++        } while (0);
++
++        // state-direct
++        do {
++            const ggml_tensor * gr = htp_gdn_unwrap_view(st);
++            if (!gr || gr->op != GGML_OP_GET_ROWS) break;
++            const int gri = node_index(gr, gi);
++            if (gri < 0) break;
++            const ggml_tensor * states = gr->src[0];
++            const ggml_tensor * idx    = gr->src[1];
++            if (!states || !idx || states->type != GGML_TYPE_F32 || idx->type != GGML_TYPE_I32 || gr->type != GGML_TYPE_F32) break;
++            if (states->ne[2] != 1 || states->ne[3] != 1 || states->nb[0] != sizeof(float) ||
++                states->nb[1] != (size_t) states->ne[0] * sizeof(float)) break;
++            if (idx->ne[1] != 1 || idx->ne[2] != 1 || idx->ne[3] != 1 || idx->nb[0] != sizeof(int32_t)) break;
++            if (!ggml_node_has_n_uses(graph, gri, 1)) break;
++            if (st != gr) {
++                const int sti = node_index(st, gi);
++                if (sti < 0 || !ggml_node_has_n_uses(graph, sti, 1)) break;
++            }
++            if (!htp_gdn_tensor_local(states) || !htp_gdn_tensor_local(idx)) break;
++            const int64_t D = st->ne[0] * st->ne[1] * st->ne[2];
++            if (D != states->ne[0] || st->ne[3] != v->ne[3] || idx->ne[0] < v->ne[3]) break;
++            f.states = states; f.idx = idx;
++            folded[gri] = 1;
++        } while (0);
++
++        if (f.alpha || f.states) {
++            folds[gdn] = f;
++        }
++    }
++}
++
++static void htp_gdn_apply_fold(htp_opnode & node, const htp_gdn_fold & f) {
++    auto * kp = node.kparams<htp_gdn_kernel_params>();
++    node.inputs.n = f.alpha ? 9 : 7;   // htp_opvec: slots 6..8 are nullptr until assigned below
++    for (size_t i = 6; i < node.inputs.n; i++) node.inputs[i] = nullptr;
++    if (f.states) {
++        node.inputs[5] = f.states;
++        node.inputs[6] = f.idx;
++        kp->flags |= HTP_GDN_FLAG_STATE_DIRECT;
++    } else {
++        node.inputs[6] = node.inputs[5];   // placeholder, unused without the flag
++    }
++    if (f.alpha) {
++        node.inputs[3] = f.alpha;
++        node.inputs[4] = f.beta_raw;
++        node.inputs[7] = f.dt;
++        node.inputs[8] = f.A;
++        kp->flags |= HTP_GDN_FLAG_GATES;
++    }
++}
++
++// ---- Decode-time SSM_CONV_DIRECT fold ----
++// GET_ROWS(cache_r) -> old; CONCAT(old, x^T) -> cat; CPY(cat[1:], cache_r slot); SSM_CONV(cat, w) -> y; [SILU(y)]
++// becomes one op that reads old/x/w, writes the next state into the cache slot and y (with SiLU) directly.
++// The model graph pins old and x on the SSM_CONV node as src[2]/src[3] (see src/models/qwen35*.cpp).
++struct htp_conv_fold {
++    const ggml_tensor * x     = nullptr;
++    const ggml_tensor * old   = nullptr;
++    const ggml_tensor * w     = nullptr;
++    const ggml_tensor * next  = nullptr;   // CPY node: the recurrent-cache slot view
++    const ggml_tensor * y_out = nullptr;   // y, or the SILU output when folded
++    const ggml_tensor * cpy   = nullptr;
++    const ggml_tensor * silu  = nullptr;
++    uint32_t n_hvx = 0;
++    uint32_t vtcm  = 0;
++};
++
++static bool htp_conv_ranges_overlap(const ggml_tensor * a, const ggml_tensor * b) {
++    if (!a || !b || !a->data || !b->data) return false;
++    const uintptr_t a0 = (uintptr_t) a->data, a1 = a0 + ggml_nbytes(a);
++    const uintptr_t b0 = (uintptr_t) b->data, b1 = b0 + ggml_nbytes(b);
++    return a0 < b1 && b0 < a1;
++}
++
++static void htp_conv_prepass(const ggml_cgraph * graph, const ggml_hexagon_session * sess,
++                             std::vector<char> & folded, std::unordered_map<const ggml_tensor *, htp_conv_fold> & folds) {
++    if (!opt_gdn_fold) return;
++
++    const int n = graph->n_nodes;
++    std::unordered_map<const ggml_tensor *, int> index;
++    index.reserve(n);
++    for (int i = 0; i < n; i++) index[graph->nodes[i]] = i;
++    auto node_index = [&](const ggml_tensor * t) -> int {
++        auto it = index.find(t);
++        return it == index.end() ? -1 : it->second;
++    };
++    auto shape = [](const ggml_tensor * t, int64_t a, int64_t b) {
++        return t && t->type == GGML_TYPE_F32 && t->ne[0] == a && t->ne[1] == b && t->ne[2] == 1 && t->ne[3] == 1;
++    };
++    auto operand = [&](const ggml_tensor * t, int64_t a, int64_t b) {
++        return shape(t, a, b) && ggml_is_contiguous(t) && htp_gdn_tensor_local(t) &&
++               ((reinterpret_cast<uintptr_t>(t->data) & 127) == 0);
++    };
++
++    const uint32_t sess_n_hvx = htp_session_n_hvx(sess);
++    const size_t   sess_vtcm  = htp_session_vtcm_size(sess);
++
++    for (int yi = 0; yi < n; yi++) {
++        const ggml_tensor * y = graph->nodes[yi];
++        if (y->op != GGML_OP_SSM_CONV || !ggml_hexagon_op_is_compute(y) || !y->src[2] || !y->src[3]) continue;
++        const ggml_tensor * cat = y->src[0];
++        const ggml_tensor * w   = y->src[1];
++        const ggml_tensor * old = y->src[2];
++        const ggml_tensor * x   = y->src[3];
++        const int64_t C = y->ne[0];
++        const int64_t T = y->ne[1];
++        if (T != 1 || C <= 0 || (C % HTP_SSM_DIRECT_SLICE) != 0 || y->ne[2] != 1) continue;
++        if (!operand(y, C, T) || !operand(x, C, T) || !operand(old, 3, C) || !operand(w, 4, C) ||
++            !operand(cat, T + 3, C) || cat->op != GGML_OP_CONCAT || cat->view_src ||
++            ggml_get_op_params_i32(cat, 0) != 0 || cat->src[0] != old || cat->src[2]) continue;
++        const ggml_tensor * xt = cat->src[1];
++        if (!xt || xt->op != GGML_OP_TRANSPOSE || xt->src[0] != x || xt->ne[0] != T || xt->ne[1] != C ||
++            xt->data != x->data || xt->nb[0] != x->nb[1] || xt->nb[1] != x->nb[0]) continue;
++        const int ci = node_index(cat);
++        if (ci < 0 || ci >= yi) continue;
++
++        // the state write-back: CPY(view(cat, [3, C] at +T floats), cache slot)
++        htp_conv_fold f;
++        int cpi = -1;
++        for (int k = ci + 1; k < yi; k++) {
++            const ggml_tensor * cp = graph->nodes[k];
++            if (cp->op != GGML_OP_CPY || !cp->src[0] || !cp->src[1]) continue;
++            const ggml_tensor * sv = cp->src[0];
++            if (sv->op != GGML_OP_VIEW || sv->view_src != cat || sv->view_offs != (size_t) T * sizeof(float) ||
++                sv->type != GGML_TYPE_F32 || sv->ne[0] != 3 || sv->ne[1] != C || sv->ne[2] != 1 || sv->ne[3] != 1 ||
++                sv->nb[0] != sizeof(float) || sv->nb[1] != cat->nb[1]) continue;
++            const ggml_tensor * dstv = cp->src[1];
++            if (!shape(dstv, 3 * C, 1) || !ggml_is_contiguous(dstv) || !htp_gdn_tensor_local(dstv) ||
++                cp->type != GGML_TYPE_F32 || cp->data != dstv->data || ggml_nbytes(cp) != ggml_nbytes(dstv) ||
++                ((reinterpret_cast<uintptr_t>(cp->data) & 127) != 0)) continue;
++            cpi = k;
++            f.next = cp;
++            f.cpy  = cp;
++            break;
++        }
++        if (cpi < 0) continue;
++        if (!ggml_node_has_n_uses(graph, ci, 2)) continue;   // the conv and the write-back view
++
++        // nothing else between the concat and the conv may touch these buffers
++        bool clean = true;
++        for (int k = ci + 1; k < yi && clean; k++) {
++            const ggml_tensor * t = graph->nodes[k];
++            if (k == cpi || (t->op == GGML_OP_VIEW && t->view_src == cat)) continue;
++            if (!ggml_hexagon_op_is_compute(t)) continue;
++            if (htp_conv_ranges_overlap(t, cat) || htp_conv_ranges_overlap(t, f.next) ||
++                htp_conv_ranges_overlap(t, old) || htp_conv_ranges_overlap(t, x)) clean = false;
++            for (int si = 0; si < GGML_MAX_SRC && clean; si++) {
++                const ggml_tensor * sv = t->src[si];
++                if (sv && (htp_conv_ranges_overlap(sv, cat) || htp_conv_ranges_overlap(sv, f.next))) clean = false;
++            }
++        }
++        if (!clean) continue;
++
++        // optional SiLU on y
++        f.y_out = y;
++        if (ggml_node_has_n_uses(graph, yi, 1)) {
++            for (int k = yi + 1; k < n && k <= yi + 2; k++) {
++                const ggml_tensor * sn = graph->nodes[k];
++                if (sn->op == GGML_OP_UNARY && ggml_get_unary_op(sn) == GGML_UNARY_OP_SILU && sn->src[0] == y &&
++                    ggml_hexagon_op_is_compute(sn) && ggml_are_same_layout(y, sn) && htp_gdn_tensor_local(sn) &&
++                    ((reinterpret_cast<uintptr_t>(sn->data) & 127) == 0) && !htp_conv_ranges_overlap(sn, x) &&
++                    !htp_conv_ranges_overlap(sn, old) && !htp_conv_ranges_overlap(sn, f.next)) {
++                    f.silu  = sn;
++                    f.y_out = sn;
++                    folded[k] = 1;
++                    break;
++                }
++            }
++        }
++
++        const uint32_t n_hvx = std::min<uint32_t>(sess_n_hvx, (uint32_t) (C / HTP_SSM_DIRECT_SLICE));
++        const uint64_t vtcm  = (uint64_t) n_hvx * htp_ssm_direct_vtcm_bytes_per_thread((uint32_t) T);
++        if (n_hvx == 0 || vtcm > sess_vtcm) { if (f.silu) folded[node_index(f.silu)] = 0; continue; }
++
++        f.x = x; f.old = old; f.w = w; f.n_hvx = n_hvx; f.vtcm = (uint32_t) vtcm;
++        folded[ci]  = 1;
++        folded[cpi] = 1;
++        folds[y] = f;
++    }
++}
++
++static void htp_conv_apply_fold(htp_opnode & node, const htp_conv_fold & f) {
++    auto * kp = node.kparams<htp_ssm_conv_kernel_params>();
++    kp->n_hvx     = f.n_hvx;
++    kp->vtcm_size = f.vtcm;
++    kp->silu      = f.silu ? 1 : 0;
++    node.inputs.clear();
++    node.inputs.push_back(f.x);
++    node.inputs.push_back(f.old);
++    node.inputs.push_back(f.w);
++    node.outputs.clear();
++    node.outputs.push_back(f.next);
++    node.outputs.push_back(f.y_out);
++    node.fused.push_back(f.cpy);
++    if (f.silu) node.fused.push_back(f.silu);
++}
++
+ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, ggml_cgraph * graph) {
+     auto sess = static_cast<ggml_hexagon_session *>(backend->context);
+ 
+@@ -2462,9 +2753,15 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
+ 
+         computed_nodes.reserve(graph->n_nodes);
+ 
++        std::vector<char> folded(graph->n_nodes, 0);
++        std::unordered_map<const ggml_tensor *, htp_gdn_fold> folds;
++        htp_gdn_prepass(graph, sess, folded, folds);
++        std::unordered_map<const ggml_tensor *, htp_conv_fold> conv_folds;
++        htp_conv_prepass(graph, sess, folded, conv_folds);
++
+         for (int i = 0; i < graph->n_nodes; ++i) {
+             ggml_tensor * n = graph->nodes[i];
+-            if (!ggml_hexagon_op_is_compute(n)) {
++            if (!ggml_hexagon_op_is_compute(n) || folded[i]) {
+                 continue;
+             }
+ 
+@@ -2476,6 +2773,25 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
+             htp_opnode node(opcode, n);
+             GGML_ASSERT(htp_kparams_solve(sess, node));
+ 
++            if (opcode == HTP_OP_GATED_DELTA_NET) {
++                auto fit = folds.find(n);
++                if (fit != folds.end()) {
++                    htp_gdn_apply_fold(node, fit->second);
++                    HEX_VERBOSE("ggml-hex: %s gdn-fold %s state-direct %d gates %d\n", sess->c_name(), n->name,
++                                fit->second.states ? 1 : 0, fit->second.alpha ? 1 : 0);
++                }
++            }
++            if (opcode == HTP_OP_SSM_CONV) {
++                auto cit = conv_folds.find(n);
++                if (cit != conv_folds.end()) {
++                    htp_conv_apply_fold(node, cit->second);
++                    HEX_VERBOSE("ggml-hex: %s conv-direct %s n_hvx %u silu %d\n", sess->c_name(), n->name,
++                                cit->second.n_hvx, cit->second.silu ? 1 : 0);
++                } else if (node.inputs.size() > 2) {
++                    node.inputs.n = 2;   // drop the model-graph operand pins; the stock kernel uses src[0:2]
++                }
++            }
++
+             computed_nodes.push_back(std::move(node));
+         }
+ 
+@@ -3468,6 +3784,7 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
+     const char * str_fa_split  = getenv("GGML_HEXAGON_FA_SPLIT");
+     const char * str_li_select = getenv("GGML_HEXAGON_LI_SELECT");
+     const char * str_gdn_select = getenv("GGML_HEXAGON_GDN_SELECT");
++    const char * str_gdn_fold = getenv("GGML_HEXAGON_GDN_FOLD");
+     const char * str_ar_select = getenv("GGML_HEXAGON_AR_SELECT");
+     const char * str_ar_scatter = getenv("GGML_HEXAGON_AR_SCATTER");
+     const char * str_ndev     = getenv("GGML_HEXAGON_NDEV");
+@@ -3535,6 +3852,7 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
+     opt_fa_split  = str_fa_split  ? atoi(str_fa_split)                   : opt_fa_split;
+     opt_li_select = str_li_select ? atoi(str_li_select)                   : opt_li_select;
+     opt_gdn_select    = str_gdn_select    ? atoi(str_gdn_select)          : opt_gdn_select;
++    opt_gdn_fold      = str_gdn_fold      ? atoi(str_gdn_fold)            : opt_gdn_fold;
+     opt_ar_select     = str_ar_select     ? atoi(str_ar_select)           : opt_ar_select;
+     opt_ar_scatter    = str_ar_scatter    ? atoi(str_ar_scatter)          : opt_ar_scatter;
+ 
+diff --git a/ggml/src/ggml-hexagon/htp-common.h b/ggml/src/ggml-hexagon/htp-common.h
+index 4e9e54415..746eeb86b 100644
+--- a/ggml/src/ggml-hexagon/htp-common.h
++++ b/ggml/src/ggml-hexagon/htp-common.h
+@@ -25,6 +25,7 @@ extern int    opt_fa_select;
+ extern int    opt_fa_split;
+ extern int    opt_li_select;
+ extern int    opt_gdn_select;
++extern int    opt_gdn_fold;
+ extern int    opt_ar_select;
+ extern int    opt_ar_scatter;
+ 
+diff --git a/ggml/src/ggml-hexagon/htp-fusion.cpp b/ggml/src/ggml-hexagon/htp-fusion.cpp
+index eb0862669..a70ca6ef3 100644
+--- a/ggml/src/ggml-hexagon/htp-fusion.cpp
++++ b/ggml/src/ggml-hexagon/htp-fusion.cpp
+@@ -388,7 +388,10 @@ static bool fuse_ssm_conv_silu(const ggml_hexagon_session * sess, htp_opnode & p
+     if (!htp_match_consumer(prev, cur, /*commutative=*/ false)) return false;
+ 
+     const ggml_tensor * conv_dst = prev.dst();
+-    const ggml_tensor * dst      = cur.dst();
++    // cur.dst() may be a collapsed dummy (htp_opnode_collapse re-rows element-wise unary ops
++    // for the HVX threads, e.g. 8192x1 -> 512x16 in one-token graphs); compare and chain the
++    // real graph tensor so the fused conv keeps its own layout.
++    const ggml_tensor * dst      = cur.node;
+     if (!ggml_are_same_layout(conv_dst, dst)) return false;
+     if (htp_tensors_overlap(dst, prev.src0()) || htp_tensors_overlap(dst, prev.src1())) return false;
+ 
+diff --git a/ggml/src/ggml-hexagon/htp/gated-delta-net-ops.c b/ggml/src/ggml-hexagon/htp/gated-delta-net-ops.c
+index 0280f99a4..05e25e0bf 100644
+--- a/ggml/src/ggml-hexagon/htp/gated-delta-net-ops.c
++++ b/ggml/src/ggml-hexagon/htp/gated-delta-net-ops.c
+@@ -8,6 +8,7 @@
+ #include "hvx-copy.h"
+ #include "hvx-reduce.h"
+ #include "hvx-exp.h"
++#include "hvx-sigmoid.h"
+ #include "dma-queue.h"
+ #include "ggml-common.h"
+ #include "htp-ctx.h"
+@@ -892,6 +893,70 @@ static void gated_delta_net_f32_pp_thread(const htp_thread_t * th, unsigned int
+     dma_queue_flush(dma_q);
+ }
+ 
++// ---- decode folds (HTP_GDN_FLAG_*) ----
++static inline dma_addr_t gdn_state_in_addr(const struct htp_tensor * state,
++                                           const struct htp_tensor * state_idx,
++                                           const struct htp_gdn_kernel_params * kp,
++                                           uint32_t piv3, uint32_t piv1, uint32_t S_v) {
++    if (kp->flags & HTP_GDN_FLAG_STATE_DIRECT) {
++        const int32_t * idx = (const int32_t *) (uintptr_t) state_idx->data;
++        return state->data + (uint64_t) idx[piv3] * state->nb[1] + (uint64_t) piv1 * S_v * S_v * sizeof(float);
++    }
++    return state->data + ((uint64_t) piv3 * kp->state_seq_stride + (uint64_t) piv1 * S_v * S_v) * sizeof(float);
++}
++
++static inline float gdn_gate_elem(const struct htp_tensor * t, uint32_t h) {
++    const size_t stride = (t->ne[0] > 1) ? t->nb[0] : t->nb[1];
++    return *(const float *) ((const uint8_t *) (uintptr_t) t->data + (size_t) h * stride);
++}
++
++// Same instruction sequence as hvx_softplus_f32_aa in unary-ops.c (x for x > 20, else log(1 + exp(x))).
++static inline void gdn_softplus_f32_aa(uint8_t * restrict dst, const uint8_t * restrict src, uint32_t n) {
++    const HVX_Vector * restrict v_src = (const HVX_Vector *) src;
++    HVX_Vector * restrict v_dst       = (HVX_Vector *) dst;
++    const HVX_Vector twenty = hvx_vec_splat_f32(20.0f);
++    const HVX_Vector one    = hvx_vec_splat_f32(1.0f);
++    const uint32_t nvec = n / VLEN_FP32;
++    const uint32_t nloe = n % VLEN_FP32;
++    for (uint32_t i = 0; i < nvec; i++) {
++        HVX_Vector x             = v_src[i];
++        HVX_VectorPred pred_gt20 = Q6_Q_vcmp_gt_VsfVsf(x, twenty);
++        HVX_Vector expx          = hvx_vec_exp_f32(x);
++        HVX_Vector logv          = hvx_vec_log_f32(hvx_vec_add_f32_f32(one, expx));
++        v_dst[i]                 = Q6_V_vmux_QVV(pred_gt20, x, logv);
++    }
++    if (nloe > 0) {
++        HVX_Vector x             = v_src[nvec];
++        HVX_VectorPred pred_gt20 = Q6_Q_vcmp_gt_VsfVsf(x, twenty);
++        HVX_Vector expx          = hvx_vec_exp_f32(x);
++        HVX_Vector logv          = hvx_vec_log_f32(hvx_vec_add_f32_f32(one, expx));
++        HVX_Vector sp            = Q6_V_vmux_QVV(pred_gt20, x, logv);
++        hvx_vec_store_a((void *) &v_dst[nvec], nloe * sizeof(float), sp);
++    }
++}
++
++// Per-thread HVX scratch for the fused gates (static: the toolchain does not honour aligned() on stack arrays).
++static float gdn_gate_scratch[HTP_MAX_NTHREADS + 1][8][32] __attribute__((aligned(128)));
++
++// ADD(alpha, dt) -> SOFTPLUS -> MUL(A) and SIGMOID(beta_raw), with the routines the separate ops use.
++static void gdn_compute_gates(const struct htp_ops_context * octx, unsigned int ith, uint32_t H, float ** g_out_p, float ** b_out_p) {
++    float (*sc)[32] = gdn_gate_scratch[ith];
++    float * a = sc[0], * d = sc[1], * aa = sc[2], * br = sc[3], * t1 = sc[4], * t2 = sc[5];
++    float * g_out = sc[6], * b_out = sc[7];
++    *g_out_p = g_out; *b_out_p = b_out;
++    memset(sc, 0, 8 * 32 * sizeof(float));
++    for (uint32_t h = 0; h < H; h++) {
++        a[h]  = gdn_gate_elem(octx->src[3], h);
++        br[h] = gdn_gate_elem(octx->src[4], h);
++        d[h]  = gdn_gate_elem(octx->src[7], h);
++        aa[h] = gdn_gate_elem(octx->src[8], h);
++    }
++    hvx_add_f32_aaa((uint8_t *) t1, (const uint8_t *) a, (const uint8_t *) d, H);
++    gdn_softplus_f32_aa((uint8_t *) t2, (const uint8_t *) t1, H);
++    hvx_mul_f32_aaa((uint8_t *) g_out, (const uint8_t *) t2, (const uint8_t *) aa, H);
++    hvx_sigmoid_f32_aa((uint8_t *) b_out, (const uint8_t *) br, H);
++}
++
+ static void gated_delta_net_f32_tg_thread(const htp_thread_t * th, unsigned int nth, unsigned int ith, void * data) {
+     struct htp_gdn_context * gctx = (struct htp_gdn_context *) data;
+     struct htp_ops_context * octx = gctx->octx;
+@@ -930,7 +995,12 @@ static void gated_delta_net_f32_tg_thread(const htp_thread_t * th, unsigned int
+     const struct fastdiv_values * fd_rq3 = &kparams->div_rq3;
+     const struct fastdiv_values * fd_rk3 = &kparams->div_rk3;
+ 
+-    const uint32_t state_seq_stride = kparams->state_seq_stride;
++    const bool fused_gates = (kparams->flags & HTP_GDN_FLAG_GATES) != 0;
++    float * gate_g = NULL;
++    float * gate_b = NULL;
++    if (fused_gates) {
++        gdn_compute_gates(octx, ith, H, &gate_g, &gate_b);
++    }
+     const dma_addr_t state_out_dma_base = dst_cache ? dst_cache->data : (dst->data + S_v * H * n_seqs * sizeof(float));
+ 
+     uint32_t ir_prefetch = gctx->row_start + ith;
+@@ -940,7 +1010,7 @@ static void gated_delta_net_f32_tg_thread(const htp_thread_t * th, unsigned int
+     for (int step = 0; step < 2 && ir_prefetch < row_end; step++) {
+         const uint32_t piv1 = fastmodulo(ir_prefetch, H, fd_H);
+         const uint32_t piv3 = fastdiv(ir_prefetch, fd_H);
+-        dma_addr_t ps_in  = state->data + ((uint64_t) piv3 * state_seq_stride + (uint64_t) piv1 * S_v * S_v) * sizeof(float);
++        dma_addr_t ps_in  = gdn_state_in_addr(state, octx->src[6], kparams, piv3, piv1, S_v);
+         dma_addr_t ps_out = state_out_dma_base + ((uint64_t) piv3 * H + piv1) * S_v * S_v * sizeof(float);
+ 
+         // Push dummy write-back
+@@ -983,9 +1053,9 @@ static void gated_delta_net_f32_tg_thread(const htp_thread_t * th, unsigned int
+                 (uint64_t) ik3 * k->nb[3] + (uint64_t) ik1 * k->nb[1]);
+         const float * v_t = (const float *) ((const uint8_t *) (uintptr_t) v->data +
+                 (uint64_t) iv3 * v->nb[3] + (uint64_t) iv1 * v->nb[1]);
+-        const float * g_t = (const float *) ((const uint8_t *) (uintptr_t) g->data +
++        const float * g_t = fused_gates ? &gate_g[iv1] : (const float *) ((const uint8_t *) (uintptr_t) g->data +
+                 (uint64_t) iv3 * g->nb[3] + (uint64_t) iv1 * g->nb[1]);
+-        const float beta_val = *(const float *) ((const uint8_t *) (uintptr_t) beta->data +
++        const float beta_val = fused_gates ? gate_b[iv1] : *(const float *) ((const uint8_t *) (uintptr_t) beta->data +
+                 (uint64_t) iv3 * beta->nb[3] + (uint64_t) iv1 * beta->nb[1]);
+ 
+         htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) ir);
+@@ -1005,7 +1075,7 @@ static void gated_delta_net_f32_tg_thread(const htp_thread_t * th, unsigned int
+         if (ir_prefetch < row_end) {
+             const uint32_t piv1 = fastmodulo(ir_prefetch, H, fd_H);
+             const uint32_t piv3 = fastdiv(ir_prefetch, fd_H);
+-            dma_addr_t ps_in = state->data + ((uint64_t) piv3 * state_seq_stride + (uint64_t) piv1 * S_v * S_v) * sizeof(float);
++            dma_addr_t ps_in = gdn_state_in_addr(state, octx->src[6], kparams, piv3, piv1, S_v);
+ 
+             dma_queue_push(dma_q, dma_make_data(s_work[spad_idx], ps_in),
+                            S_v * sizeof(float), S_v * sizeof(float),
+diff --git a/ggml/src/ggml-hexagon/htp/gated-delta-net-ops.h b/ggml/src/ggml-hexagon/htp/gated-delta-net-ops.h
+index aff1eb645..88129cbab 100644
+--- a/ggml/src/ggml-hexagon/htp/gated-delta-net-ops.h
++++ b/ggml/src/ggml-hexagon/htp/gated-delta-net-ops.h
+@@ -13,6 +13,12 @@
+ #define HTP_GDN_CHUNK_SIZE 64
+ #define HTP_GDN_MIN_TOKENS 8
+ 
++// Decode-time folds (one token, one sequence, HVX recurrent kernel only):
++//  STATE_DIRECT: src[5] is the whole state buffer [D, n_slots], src[6] the i32 slot index (the GET_ROWS copy is dropped)
++//  GATES:        src[3] = alpha, src[4] = beta_raw, src[7] = dt_bias, src[8] = A; g/beta are computed in-kernel
++#define HTP_GDN_FLAG_STATE_DIRECT 1u
++#define HTP_GDN_FLAG_GATES        2u
++
+ #ifndef HMX_FP16_TILE_SIZE
+ #define HMX_FP16_TILE_SIZE 2048
+ #endif
+@@ -43,6 +49,7 @@ struct htp_gdn_kernel_params {
+     uint32_t state_size_per_snap;
+ 
+     float    scale;
++    uint32_t flags;              // HTP_GDN_FLAG_* (decode folds, see gated-delta-net-ops.c)
+ 
+     struct fastdiv_values div_H;
+     struct fastdiv_values div_q1;
+diff --git a/ggml/src/ggml-hexagon/htp/ssm-conv.c b/ggml/src/ggml-hexagon/htp/ssm-conv.c
+index d75304fef..17121802d 100644
+--- a/ggml/src/ggml-hexagon/htp/ssm-conv.c
++++ b/ggml/src/ggml-hexagon/htp/ssm-conv.c
+@@ -20,6 +20,8 @@
+ #include "htp-tensor.h"
+ #include "hvx-utils.h"
+ #include "ssm-conv.h"
++#include "hvx-arith.h"
++#include "hvx-sigmoid.h"
+ 
+ struct htp_ssm_conv_context {
+     struct htp_ops_context *                  octx;
+@@ -634,7 +636,132 @@ int op_ssm_conv_f32(struct htp_ops_context * octx) {
+     return HTP_STATUS_OK;
+ }
+ 
++// ---- SSM_CONV_DIRECT: one-token conv straight from the recurrent-cache state, state write-back and optional SiLU ----
++#include "qedge_prefill4/candidate.c"
++
++struct ssm_direct_task {
++    struct htp_ops_context * octx;
++    uint32_t channels;
++    uint32_t tokens;
++    uint32_t silu;
++    uint32_t per_thread_bytes;
++    bool     failed[HTP_OP_MAX_NTHREADS];
++};
++
++static bool ssm_direct_tensor_ok(const struct htp_context * ctx, const struct htp_tensor * t, uint32_t cols, uint32_t rows) {
++    const uint64_t bytes = (uint64_t) cols * rows * sizeof(float);
++    if (!t || t->type != HTP_TYPE_F32 || (t->flags & (HTP_TENSOR_TILED | HTP_TENSOR_FENCE)) ||
++        t->ne[0] != cols || t->ne[1] != rows || t->ne[2] != 1 || t->ne[3] != 1 ||
++        !htp_tensor_is_contiguous(t, sizeof(float)) || t->size != bytes ||
++        !t->data || (t->data & 127u) || t->data > UINT32_MAX - bytes) {
++        return false;
++    }
++    for (uint32_t i = 0; i < HTP_MAX_MMAPS; ++i) {
++        const struct htp_mmap * m = &ctx->mmap[i];
++        if (!(m->flags & HTP_BUF_EXTENDED) && m->size >= bytes &&
++            t->data >= m->base && t->data - m->base <= m->size - bytes) {
++            return true;
++        }
++    }
++    return false;
++}
++
++static void ssm_direct_worker(const htp_thread_t * th, unsigned int nth, unsigned int ith, void * data) {
++    struct ssm_direct_task * task = data;
++    struct htp_ops_context * octx = task->octx;
++    const uint32_t tokens = task->tokens;
++    const uint32_t tile   = HTP_SSM_DIRECT_SLICE;
++    const uint32_t row    = tile * sizeof(float);
++    float * x      = (float *) (octx->ctx->vtcm_base + (size_t) ith * task->per_thread_bytes);
++    float * y      = x + tokens * tile;
++    float * old    = y + tokens * tile;
++    float * weight = old + 3 * tile;
++    float * next   = weight + 4 * tile;
++    dma_queue * q = th->dma_q;
++    struct htp_thread_trace * tr = th->trace;
++
++    for (uint32_t c = ith * tile; c < task->channels; c += nth * tile) {
++        const uint32_t off = c * sizeof(float);
++        if (!dma_queue_push(q, dma_make_data(old, octx->src[1]->data + 3 * off), 3 * row, 3 * row, 3 * row, 1) ||
++            !dma_queue_push(q, dma_make_data(weight, octx->src[2]->data + 4 * off), 4 * row, 4 * row, 4 * row, 1) ||
++            !dma_queue_push(q, dma_make_data(x, octx->src[0]->data + off), row, octx->src[0]->nb[1], row, tokens)) {
++            goto dma_failed;
++        }
++        dma_queue_flush(q);
++        htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) c);
++        prefill4_hvx(x, old, weight, y, next, tokens, tile);
++        if (task->silu) {
++            // same two routines and operand order as the stock SILU kernel, one vector at a time; the old-state
++            // block is free once prefill4_hvx has consumed it, so it is the (VTCM) scratch vector
++            float * silu_tmp = old;
++            for (uint32_t i = 0; i < tokens * tile; i += 32) {
++                hvx_sigmoid_f32_aa((uint8_t *) silu_tmp, (const uint8_t *) (y + i), 32);
++                hvx_mul_f32_aaa((uint8_t *) (y + i), (const uint8_t *) (y + i), (const uint8_t *) silu_tmp, 32);
++            }
++        }
++        htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) c);
++        if (!dma_queue_push(q, dma_make_data(octx->dsts[1]->data + off, y), octx->dsts[1]->nb[1], row, row, tokens) ||
++            !dma_queue_push(q, dma_make_data(octx->dsts[0]->data + 3 * off, next), 3 * row, 3 * row, 3 * row, 1)) {
++            goto dma_failed;
++        }
++        dma_queue_flush(q);
++    }
++    return;
++dma_failed:
++    dma_queue_flush(q);
++    task->failed[ith] = true;
++}
++
++static int op_ssm_direct(struct htp_ops_context * octx) {
++    const struct htp_ssm_conv_kernel_params * kp = (const struct htp_ssm_conv_kernel_params *) octx->kernel_params;
++    const uint32_t tokens   = kp->n_t;
++    const uint32_t channels = kp->d_inner;
++    struct htp_context * ctx = octx->ctx;
++    if (tokens != 1 || channels == 0 || (channels % HTP_SSM_DIRECT_SLICE) != 0 || ctx->mdev.count > 1) {
++        return HTP_STATUS_NO_SUPPORT;
++    }
++    if (!htp_ops_context_set_n_hvx(octx, kp->n_hvx)) {
++        return HTP_STATUS_INVAL_PARAMS;
++    }
++    const uint32_t n_hvx = octx->n_hvx;
++    const uint32_t per_thread_bytes = htp_ssm_direct_vtcm_bytes_per_thread(tokens);
++    const uint64_t bytes = (uint64_t) per_thread_bytes * n_hvx;
++    if (n_hvx == 0 || n_hvx > HTP_OP_MAX_NTHREADS || kp->vtcm_size != bytes) {
++        return HTP_STATUS_INVAL_PARAMS;
++    }
++    if (ctx->vtcm_size < bytes || !ctx->vtcm_base || ((uintptr_t) ctx->vtcm_base & 127u)) {
++        return HTP_STATUS_VTCM_TOO_SMALL;
++    }
++    const struct htp_tensor * ts[] = { octx->src[0], octx->src[1], octx->src[2], octx->dsts[0], octx->dsts[1] };
++    if (!ssm_direct_tensor_ok(ctx, ts[0], channels, tokens) || !ssm_direct_tensor_ok(ctx, ts[1], 3, channels) ||
++        !ssm_direct_tensor_ok(ctx, ts[2], 4, channels) || !ssm_direct_tensor_ok(ctx, ts[3], 3 * channels, 1) ||
++        !ssm_direct_tensor_ok(ctx, ts[4], channels, tokens) || ((ts[3]->flags | ts[4]->flags) & HTP_TENSOR_WEIGHT)) {
++        return HTP_STATUS_INVAL_PARAMS;
++    }
++    for (int i = 3; i < 5; ++i) {
++        for (int j = 0; j < i; ++j) {
++            if (ts[i]->data < ts[j]->data + ts[j]->size && ts[j]->data < ts[i]->data + ts[i]->size) {
++                return HTP_STATUS_INVAL_PARAMS;
++            }
++        }
++    }
++    struct ssm_direct_task task = { .octx = octx, .channels = channels, .tokens = tokens, .silu = kp->silu,
++                                    .per_thread_bytes = per_thread_bytes };
++    work_queue_run(ctx->hvx_queue, ssm_direct_worker, &task, n_hvx);
++    for (uint32_t i = 0; i < n_hvx; ++i) {
++        if (task.failed[i]) return HTP_STATUS_INTERNAL_ERR;
++    }
++    FARF(HIGH, "ssm-conv-direct: C %u T %u n_hvx %u silu %u\n", channels, tokens, n_hvx, kp->silu);
++    return HTP_STATUS_OK;
++}
++
+ int op_ssm_conv(struct htp_ops_context * octx) {
++    if (octx->src[2] || octx->dsts[1]) {
++        if (!octx->src[2] || !octx->dsts[1]) {
++            return HTP_STATUS_INVAL_PARAMS;
++        }
++        return op_ssm_direct(octx);
++    }
+     const struct htp_tensor * dst = octx->dst;
+ 
+     switch (dst->type) {
+diff --git a/ggml/src/ggml-hexagon/htp/ssm-conv.h b/ggml/src/ggml-hexagon/htp/ssm-conv.h
+index 7c3f3041f..efb787b76 100644
+--- a/ggml/src/ggml-hexagon/htp/ssm-conv.h
++++ b/ggml/src/ggml-hexagon/htp/ssm-conv.h
+@@ -8,6 +8,15 @@
+ #include "htp-ops.h"
+ #include "htp-vtcm.h"
+ 
++// SSM_CONV_DIRECT (decode): src[0] = x [C, T], src[1] = old state [3, C], src[2] = weight [4, C];
++// dsts[0] = next state [3C, 1] (the recurrent-cache slot), dsts[1] = y [C, T] (SiLU applied when kparams->silu).
++// The host selects it by giving the op three inputs and two outputs; see htp_conv_direct_* in ggml-hexagon.cpp.
++enum { HTP_SSM_DIRECT_SLICE = 128 };
++
++static inline uint32_t htp_ssm_direct_vtcm_bytes_per_thread(uint32_t tokens) {
++    return (2 * tokens + 3 + 4 + 3) * HTP_SSM_DIRECT_SLICE * sizeof(float);
++}
++
+ struct htp_ssm_conv_kernel_params {
+     uint32_t n_hvx;
+     uint32_t d_conv;
+diff --git a/src/models/qwen35.cpp b/src/models/qwen35.cpp
+index 6ec3cff44..f55dab2e7 100644
+--- a/src/models/qwen35.cpp
++++ b/src/models/qwen35.cpp
+@@ -388,6 +388,13 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
+     cb(state, "state_predelta", il);
+ 
+     ggml_tensor * conv_output_proper = ggml_ssm_conv(ctx0, conv_input, conv_kernel);
++    if (n_seqs == 1 && n_seq_tokens == 1 && conv_kernel_size == 4 && (conv_channels % 128) == 0 &&
++        conv_kernel->ne[1] == conv_channels) {
++        // Pin the unmaterialized operands (old state, new token) for the Hexagon direct conv; ordinary
++        // backends keep using src[0:2].
++        conv_output_proper->src[2] = conv_input->src[0];
++        conv_output_proper->src[3] = qkv_mixed;
++    }
+     cb(conv_output_proper, "conv_output_raw", il);
+ 
+     ggml_tensor * conv_output_silu = ggml_silu(ctx0, conv_output_proper);
+diff --git a/src/models/qwen35moe.cpp b/src/models/qwen35moe.cpp
+index c0ee6fa03..e759730b5 100644
+--- a/src/models/qwen35moe.cpp
++++ b/src/models/qwen35moe.cpp
+@@ -398,6 +398,13 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn_linear(
+     cb(state, "state_predelta", il);
+ 
+     ggml_tensor * conv_output_proper = ggml_ssm_conv(ctx0, conv_input, conv_kernel);
++    if (n_seqs == 1 && n_seq_tokens == 1 && conv_kernel_size == 4 && (conv_channels % 128) == 0 &&
++        conv_kernel->ne[1] == conv_channels) {
++        // Pin the unmaterialized operands (old state, new token) for the Hexagon direct conv; ordinary
++        // backends keep using src[0:2].
++        conv_output_proper->src[2] = conv_input->src[0];
++        conv_output_proper->src[3] = qkv_mixed;
++    }
+     cb(conv_output_proper, "conv_output_raw", il);
+ 
+     ggml_tensor * conv_output_silu = ggml_silu(ctx0, conv_output_proper);

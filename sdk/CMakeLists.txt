@@ -180,7 +180,8 @@ if(GENIEX_PLUGIN_LLAMA_CPP)
     if(GGML_HEXAGON)
         list(APPEND _LLAMA_PATCHES
             "${CMAKE_CURRENT_SOURCE_DIR}/patches/llama-hexagon-release-sessions.patch"
-            "${CMAKE_CURRENT_SOURCE_DIR}/patches/llama-hexagon-power-mode-setter.patch")
+            "${CMAKE_CURRENT_SOURCE_DIR}/patches/llama-hexagon-power-mode-setter.patch"
+            "${CMAKE_CURRENT_SOURCE_DIR}/patches/llama-hexagon-x-elite-35b-port.patch")
     endif()
     if(GGML_OPENCL)
         list(APPEND _LLAMA_PATCHES
