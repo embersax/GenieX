@@ -263,7 +263,9 @@ jobs:
           PRESET: ${{ matrix.preset }}
         run: |
           $ErrorActionPreference = "Stop"
-          $BuildDir = "sdk/build-$env:PRESET"
+          # Short build dir: without the restored cargo cache (forks have none) the
+          # tokenizers-cpp proc-macro link output exceeds MAX_PATH (LNK1104).
+          $BuildDir = "C:/b"
 
           # Source vcvars into this process so cmake's child processes
           # (clang, ninja, inf2cat.exe) inherit PATH/INCLUDE/LIB for the
