@@ -683,7 +683,7 @@ index d2e3df2cf..04b391e91 100644
              for (int row = 0; row < 32; row++) {
                  const int64_t r = ct * 32 + row;
 diff --git a/ggml/src/ggml-hexagon/htp/gated-delta-net-ops.c b/ggml/src/ggml-hexagon/htp/gated-delta-net-ops.c
-index 0280f99a4..51cee910c 100644
+index 0280f99a4..109f4cb37 100644
 --- a/ggml/src/ggml-hexagon/htp/gated-delta-net-ops.c
 +++ b/ggml/src/ggml-hexagon/htp/gated-delta-net-ops.c
 @@ -8,6 +8,7 @@
@@ -694,7 +694,381 @@ index 0280f99a4..51cee910c 100644
  #include "dma-queue.h"
  #include "ggml-common.h"
  #include "htp-ctx.h"
-@@ -892,6 +893,70 @@ static void gated_delta_net_f32_pp_thread(const htp_thread_t * th, unsigned int
+@@ -574,6 +575,289 @@ static inline HVX_Vector gdn_add_scaled_dot8_f32(float * restrict dst0, float *
+     return Q6_V_vmux_QVV(q16, rA, Q6_V_vror_VR(rB, 128 - 16));
+ }
+ 
++// x-elite port: aligned-row variant (state rows in VTCM, S_v % 32 == 0): same arithmetic, aligned vector loads/stores
++static inline HVX_Vector gdn_mul_dot8_f32_a(float * restrict dst0, float * restrict dst1,
++        float * restrict dst2, float * restrict dst3, float * restrict dst4,
++        float * restrict dst5, float * restrict dst6, float * restrict dst7,
++        const HVX_Vector * restrict mul, const HVX_Vector * restrict dot, uint32_t n) {
++    HVX_Vector acc0 = Q6_V_vzero();
++    HVX_Vector acc1 = Q6_V_vzero();
++    HVX_Vector acc2 = Q6_V_vzero();
++    HVX_Vector acc3 = Q6_V_vzero();
++    HVX_Vector acc4 = Q6_V_vzero();
++    HVX_Vector acc5 = Q6_V_vzero();
++    HVX_Vector acc6 = Q6_V_vzero();
++    HVX_Vector acc7 = Q6_V_vzero();
++
++    const uint32_t epv = 128 / sizeof(float);
++    const uint32_t nvec = n / epv;
++    const uint32_t nloe = n % epv;
++    for (uint32_t i = 0; i < nvec; ++i) {
++        HVX_Vector vm   = mul[i];
++        HVX_Vector vdot = dot[i];
++
++        HVX_Vector out0 = hvx_vec_mul_f32_f32(hvx_vmem(dst0 + i * epv), vm);
++        HVX_Vector out1 = hvx_vec_mul_f32_f32(hvx_vmem(dst1 + i * epv), vm);
++        HVX_Vector out2 = hvx_vec_mul_f32_f32(hvx_vmem(dst2 + i * epv), vm);
++        HVX_Vector out3 = hvx_vec_mul_f32_f32(hvx_vmem(dst3 + i * epv), vm);
++        HVX_Vector out4 = hvx_vec_mul_f32_f32(hvx_vmem(dst4 + i * epv), vm);
++        HVX_Vector out5 = hvx_vec_mul_f32_f32(hvx_vmem(dst5 + i * epv), vm);
++        HVX_Vector out6 = hvx_vec_mul_f32_f32(hvx_vmem(dst6 + i * epv), vm);
++        HVX_Vector out7 = hvx_vec_mul_f32_f32(hvx_vmem(dst7 + i * epv), vm);
++
++        hvx_vmem(dst0 + i * epv) = out0;
++        hvx_vmem(dst1 + i * epv) = out1;
++        hvx_vmem(dst2 + i * epv) = out2;
++        hvx_vmem(dst3 + i * epv) = out3;
++        hvx_vmem(dst4 + i * epv) = out4;
++        hvx_vmem(dst5 + i * epv) = out5;
++        hvx_vmem(dst6 + i * epv) = out6;
++        hvx_vmem(dst7 + i * epv) = out7;
++
++        acc0 = hvx_vec_add_f32_f32(acc0, hvx_vec_mul_f32_f32(out0, vdot));
++        acc1 = hvx_vec_add_f32_f32(acc1, hvx_vec_mul_f32_f32(out1, vdot));
++        acc2 = hvx_vec_add_f32_f32(acc2, hvx_vec_mul_f32_f32(out2, vdot));
++        acc3 = hvx_vec_add_f32_f32(acc3, hvx_vec_mul_f32_f32(out3, vdot));
++        acc4 = hvx_vec_add_f32_f32(acc4, hvx_vec_mul_f32_f32(out4, vdot));
++        acc5 = hvx_vec_add_f32_f32(acc5, hvx_vec_mul_f32_f32(out5, vdot));
++        acc6 = hvx_vec_add_f32_f32(acc6, hvx_vec_mul_f32_f32(out6, vdot));
++        acc7 = hvx_vec_add_f32_f32(acc7, hvx_vec_mul_f32_f32(out7, vdot));
++    }
++
++    if (nloe) {
++        const uint32_t off = nvec * epv;
++        HVX_Vector vm = mul[nvec];
++        HVX_Vector vdot = dot[nvec];
++        HVX_VectorPred mask = Q6_Q_vsetq2_R(nloe * sizeof(float));
++        HVX_Vector zero = Q6_V_vzero();
++
++        HVX_Vector out0 = hvx_vec_mul_f32_f32(hvx_vmem(dst0 + off), vm);
++        HVX_Vector out1 = hvx_vec_mul_f32_f32(hvx_vmem(dst1 + off), vm);
++        HVX_Vector out2 = hvx_vec_mul_f32_f32(hvx_vmem(dst2 + off), vm);
++        HVX_Vector out3 = hvx_vec_mul_f32_f32(hvx_vmem(dst3 + off), vm);
++        HVX_Vector out4 = hvx_vec_mul_f32_f32(hvx_vmem(dst4 + off), vm);
++        HVX_Vector out5 = hvx_vec_mul_f32_f32(hvx_vmem(dst5 + off), vm);
++        HVX_Vector out6 = hvx_vec_mul_f32_f32(hvx_vmem(dst6 + off), vm);
++        HVX_Vector out7 = hvx_vec_mul_f32_f32(hvx_vmem(dst7 + off), vm);
++
++        hvx_vec_store_u(dst0 + off, nloe * sizeof(float), out0);
++        hvx_vec_store_u(dst1 + off, nloe * sizeof(float), out1);
++        hvx_vec_store_u(dst2 + off, nloe * sizeof(float), out2);
++        hvx_vec_store_u(dst3 + off, nloe * sizeof(float), out3);
++        hvx_vec_store_u(dst4 + off, nloe * sizeof(float), out4);
++        hvx_vec_store_u(dst5 + off, nloe * sizeof(float), out5);
++        hvx_vec_store_u(dst6 + off, nloe * sizeof(float), out6);
++        hvx_vec_store_u(dst7 + off, nloe * sizeof(float), out7);
++
++        acc0 = hvx_vec_add_f32_f32(acc0, Q6_V_vmux_QVV(mask, hvx_vec_mul_f32_f32(out0, vdot), zero));
++        acc1 = hvx_vec_add_f32_f32(acc1, Q6_V_vmux_QVV(mask, hvx_vec_mul_f32_f32(out1, vdot), zero));
++        acc2 = hvx_vec_add_f32_f32(acc2, Q6_V_vmux_QVV(mask, hvx_vec_mul_f32_f32(out2, vdot), zero));
++        acc3 = hvx_vec_add_f32_f32(acc3, Q6_V_vmux_QVV(mask, hvx_vec_mul_f32_f32(out3, vdot), zero));
++        acc4 = hvx_vec_add_f32_f32(acc4, Q6_V_vmux_QVV(mask, hvx_vec_mul_f32_f32(out4, vdot), zero));
++        acc5 = hvx_vec_add_f32_f32(acc5, Q6_V_vmux_QVV(mask, hvx_vec_mul_f32_f32(out5, vdot), zero));
++        acc6 = hvx_vec_add_f32_f32(acc6, Q6_V_vmux_QVV(mask, hvx_vec_mul_f32_f32(out6, vdot), zero));
++        acc7 = hvx_vec_add_f32_f32(acc7, Q6_V_vmux_QVV(mask, hvx_vec_mul_f32_f32(out7, vdot), zero));
++    }
++
++    HVX_Vector_x4 accA = { .v = { acc0, acc1, acc2, acc3 } };
++    HVX_Vector_x4 accB = { .v = { acc4, acc5, acc6, acc7 } };
++    HVX_Vector rA = hvx_vec_reduce_sum_f32x4(accA);
++    HVX_Vector rB = hvx_vec_reduce_sum_f32x4(accB);
++    HVX_VectorPred q16 = Q6_Q_vsetq2_R(16);
++    return Q6_V_vmux_QVV(q16, rA, Q6_V_vror_VR(rB, 128 - 16));
++}
++
++// x-elite port: aligned-row variant (state rows in VTCM, S_v % 32 == 0): same arithmetic, aligned vector loads/stores
++static inline HVX_Vector gdn_mul_scalar_dot8_f32_a(float * restrict dst0, float * restrict dst1,
++        float * restrict dst2, float * restrict dst3, float * restrict dst4,
++        float * restrict dst5, float * restrict dst6, float * restrict dst7,
++        HVX_Vector vmul, const HVX_Vector * restrict dot, uint32_t n) {
++    HVX_Vector acc0 = Q6_V_vzero();
++    HVX_Vector acc1 = Q6_V_vzero();
++    HVX_Vector acc2 = Q6_V_vzero();
++    HVX_Vector acc3 = Q6_V_vzero();
++    HVX_Vector acc4 = Q6_V_vzero();
++    HVX_Vector acc5 = Q6_V_vzero();
++    HVX_Vector acc6 = Q6_V_vzero();
++    HVX_Vector acc7 = Q6_V_vzero();
++
++    const uint32_t epv = 128 / sizeof(float);
++    const uint32_t nvec = n / epv;
++    const uint32_t nloe = n % epv;
++    for (uint32_t i = 0; i < nvec; ++i) {
++        HVX_Vector vdot = dot[i];
++
++        HVX_Vector out0 = hvx_vec_mul_f32_f32(hvx_vmem(dst0 + i * epv), vmul);
++        HVX_Vector out1 = hvx_vec_mul_f32_f32(hvx_vmem(dst1 + i * epv), vmul);
++        HVX_Vector out2 = hvx_vec_mul_f32_f32(hvx_vmem(dst2 + i * epv), vmul);
++        HVX_Vector out3 = hvx_vec_mul_f32_f32(hvx_vmem(dst3 + i * epv), vmul);
++        HVX_Vector out4 = hvx_vec_mul_f32_f32(hvx_vmem(dst4 + i * epv), vmul);
++        HVX_Vector out5 = hvx_vec_mul_f32_f32(hvx_vmem(dst5 + i * epv), vmul);
++        HVX_Vector out6 = hvx_vec_mul_f32_f32(hvx_vmem(dst6 + i * epv), vmul);
++        HVX_Vector out7 = hvx_vec_mul_f32_f32(hvx_vmem(dst7 + i * epv), vmul);
++
++        hvx_vmem(dst0 + i * epv) = out0;
++        hvx_vmem(dst1 + i * epv) = out1;
++        hvx_vmem(dst2 + i * epv) = out2;
++        hvx_vmem(dst3 + i * epv) = out3;
++        hvx_vmem(dst4 + i * epv) = out4;
++        hvx_vmem(dst5 + i * epv) = out5;
++        hvx_vmem(dst6 + i * epv) = out6;
++        hvx_vmem(dst7 + i * epv) = out7;
++
++        acc0 = hvx_vec_add_f32_f32(acc0, hvx_vec_mul_f32_f32(out0, vdot));
++        acc1 = hvx_vec_add_f32_f32(acc1, hvx_vec_mul_f32_f32(out1, vdot));
++        acc2 = hvx_vec_add_f32_f32(acc2, hvx_vec_mul_f32_f32(out2, vdot));
++        acc3 = hvx_vec_add_f32_f32(acc3, hvx_vec_mul_f32_f32(out3, vdot));
++        acc4 = hvx_vec_add_f32_f32(acc4, hvx_vec_mul_f32_f32(out4, vdot));
++        acc5 = hvx_vec_add_f32_f32(acc5, hvx_vec_mul_f32_f32(out5, vdot));
++        acc6 = hvx_vec_add_f32_f32(acc6, hvx_vec_mul_f32_f32(out6, vdot));
++        acc7 = hvx_vec_add_f32_f32(acc7, hvx_vec_mul_f32_f32(out7, vdot));
++    }
++
++    if (nloe) {
++        const uint32_t off = nvec * epv;
++        HVX_Vector vdot = dot[nvec];
++        HVX_VectorPred mask = Q6_Q_vsetq2_R(nloe * sizeof(float));
++        HVX_Vector zero = Q6_V_vzero();
++
++        HVX_Vector out0 = hvx_vec_mul_f32_f32(hvx_vmem(dst0 + off), vmul);
++        HVX_Vector out1 = hvx_vec_mul_f32_f32(hvx_vmem(dst1 + off), vmul);
++        HVX_Vector out2 = hvx_vec_mul_f32_f32(hvx_vmem(dst2 + off), vmul);
++        HVX_Vector out3 = hvx_vec_mul_f32_f32(hvx_vmem(dst3 + off), vmul);
++        HVX_Vector out4 = hvx_vec_mul_f32_f32(hvx_vmem(dst4 + off), vmul);
++        HVX_Vector out5 = hvx_vec_mul_f32_f32(hvx_vmem(dst5 + off), vmul);
++        HVX_Vector out6 = hvx_vec_mul_f32_f32(hvx_vmem(dst6 + off), vmul);
++        HVX_Vector out7 = hvx_vec_mul_f32_f32(hvx_vmem(dst7 + off), vmul);
++
++        hvx_vec_store_u(dst0 + off, nloe * sizeof(float), out0);
++        hvx_vec_store_u(dst1 + off, nloe * sizeof(float), out1);
++        hvx_vec_store_u(dst2 + off, nloe * sizeof(float), out2);
++        hvx_vec_store_u(dst3 + off, nloe * sizeof(float), out3);
++        hvx_vec_store_u(dst4 + off, nloe * sizeof(float), out4);
++        hvx_vec_store_u(dst5 + off, nloe * sizeof(float), out5);
++        hvx_vec_store_u(dst6 + off, nloe * sizeof(float), out6);
++        hvx_vec_store_u(dst7 + off, nloe * sizeof(float), out7);
++
++        acc0 = hvx_vec_add_f32_f32(acc0, Q6_V_vmux_QVV(mask, hvx_vec_mul_f32_f32(out0, vdot), zero));
++        acc1 = hvx_vec_add_f32_f32(acc1, Q6_V_vmux_QVV(mask, hvx_vec_mul_f32_f32(out1, vdot), zero));
++        acc2 = hvx_vec_add_f32_f32(acc2, Q6_V_vmux_QVV(mask, hvx_vec_mul_f32_f32(out2, vdot), zero));
++        acc3 = hvx_vec_add_f32_f32(acc3, Q6_V_vmux_QVV(mask, hvx_vec_mul_f32_f32(out3, vdot), zero));
++        acc4 = hvx_vec_add_f32_f32(acc4, Q6_V_vmux_QVV(mask, hvx_vec_mul_f32_f32(out4, vdot), zero));
++        acc5 = hvx_vec_add_f32_f32(acc5, Q6_V_vmux_QVV(mask, hvx_vec_mul_f32_f32(out5, vdot), zero));
++        acc6 = hvx_vec_add_f32_f32(acc6, Q6_V_vmux_QVV(mask, hvx_vec_mul_f32_f32(out6, vdot), zero));
++        acc7 = hvx_vec_add_f32_f32(acc7, Q6_V_vmux_QVV(mask, hvx_vec_mul_f32_f32(out7, vdot), zero));
++    }
++
++    HVX_Vector_x4 accA = { .v = { acc0, acc1, acc2, acc3 } };
++    HVX_Vector_x4 accB = { .v = { acc4, acc5, acc6, acc7 } };
++    HVX_Vector rA = hvx_vec_reduce_sum_f32x4(accA);
++    HVX_Vector rB = hvx_vec_reduce_sum_f32x4(accB);
++    HVX_VectorPred q16 = Q6_Q_vsetq2_R(16);
++    return Q6_V_vmux_QVV(q16, rA, Q6_V_vror_VR(rB, 128 - 16));
++}
++
++// x-elite port: aligned-row variant (state rows in VTCM, S_v % 32 == 0): same arithmetic, aligned vector loads/stores
++static inline HVX_Vector gdn_add_scaled_dot8_f32_a(float * restrict dst0, float * restrict dst1,
++        float * restrict dst2, float * restrict dst3, float * restrict dst4,
++        float * restrict dst5, float * restrict dst6, float * restrict dst7,
++        const HVX_Vector * restrict src, const float * restrict scale,
++        const HVX_Vector * restrict dot, uint32_t n) {
++    HVX_Vector acc0 = Q6_V_vzero();
++    HVX_Vector acc1 = Q6_V_vzero();
++    HVX_Vector acc2 = Q6_V_vzero();
++    HVX_Vector acc3 = Q6_V_vzero();
++    HVX_Vector acc4 = Q6_V_vzero();
++    HVX_Vector acc5 = Q6_V_vzero();
++    HVX_Vector acc6 = Q6_V_vzero();
++    HVX_Vector acc7 = Q6_V_vzero();
++    const HVX_Vector scale0 = hvx_vec_splat_f32(scale[0]);
++    const HVX_Vector scale1 = hvx_vec_splat_f32(scale[1]);
++    const HVX_Vector scale2 = hvx_vec_splat_f32(scale[2]);
++    const HVX_Vector scale3 = hvx_vec_splat_f32(scale[3]);
++    const HVX_Vector scale4 = hvx_vec_splat_f32(scale[4]);
++    const HVX_Vector scale5 = hvx_vec_splat_f32(scale[5]);
++    const HVX_Vector scale6 = hvx_vec_splat_f32(scale[6]);
++    const HVX_Vector scale7 = hvx_vec_splat_f32(scale[7]);
++
++    const uint32_t epv = 128 / sizeof(float);
++    const uint32_t nvec = n / epv;
++    const uint32_t nloe = n % epv;
++    for (uint32_t i = 0; i < nvec; ++i) {
++        HVX_Vector vs   = src[i];
++        HVX_Vector vdot = dot[i];
++
++        HVX_Vector out0 = hvx_vec_add_f32_f32(hvx_vmem(dst0 + i * epv), hvx_vec_mul_f32_f32(vs, scale0));
++        HVX_Vector out1 = hvx_vec_add_f32_f32(hvx_vmem(dst1 + i * epv), hvx_vec_mul_f32_f32(vs, scale1));
++        HVX_Vector out2 = hvx_vec_add_f32_f32(hvx_vmem(dst2 + i * epv), hvx_vec_mul_f32_f32(vs, scale2));
++        HVX_Vector out3 = hvx_vec_add_f32_f32(hvx_vmem(dst3 + i * epv), hvx_vec_mul_f32_f32(vs, scale3));
++        HVX_Vector out4 = hvx_vec_add_f32_f32(hvx_vmem(dst4 + i * epv), hvx_vec_mul_f32_f32(vs, scale4));
++        HVX_Vector out5 = hvx_vec_add_f32_f32(hvx_vmem(dst5 + i * epv), hvx_vec_mul_f32_f32(vs, scale5));
++        HVX_Vector out6 = hvx_vec_add_f32_f32(hvx_vmem(dst6 + i * epv), hvx_vec_mul_f32_f32(vs, scale6));
++        HVX_Vector out7 = hvx_vec_add_f32_f32(hvx_vmem(dst7 + i * epv), hvx_vec_mul_f32_f32(vs, scale7));
++
++        hvx_vmem(dst0 + i * epv) = out0;
++        hvx_vmem(dst1 + i * epv) = out1;
++        hvx_vmem(dst2 + i * epv) = out2;
++        hvx_vmem(dst3 + i * epv) = out3;
++        hvx_vmem(dst4 + i * epv) = out4;
++        hvx_vmem(dst5 + i * epv) = out5;
++        hvx_vmem(dst6 + i * epv) = out6;
++        hvx_vmem(dst7 + i * epv) = out7;
++
++        acc0 = hvx_vec_add_f32_f32(acc0, hvx_vec_mul_f32_f32(out0, vdot));
++        acc1 = hvx_vec_add_f32_f32(acc1, hvx_vec_mul_f32_f32(out1, vdot));
++        acc2 = hvx_vec_add_f32_f32(acc2, hvx_vec_mul_f32_f32(out2, vdot));
++        acc3 = hvx_vec_add_f32_f32(acc3, hvx_vec_mul_f32_f32(out3, vdot));
++        acc4 = hvx_vec_add_f32_f32(acc4, hvx_vec_mul_f32_f32(out4, vdot));
++        acc5 = hvx_vec_add_f32_f32(acc5, hvx_vec_mul_f32_f32(out5, vdot));
++        acc6 = hvx_vec_add_f32_f32(acc6, hvx_vec_mul_f32_f32(out6, vdot));
++        acc7 = hvx_vec_add_f32_f32(acc7, hvx_vec_mul_f32_f32(out7, vdot));
++    }
++
++    if (nloe) {
++        const uint32_t off = nvec * epv;
++        HVX_Vector vs   = src[nvec];
++        HVX_Vector vdot = dot[nvec];
++        HVX_VectorPred mask = Q6_Q_vsetq2_R(nloe * sizeof(float));
++        HVX_Vector zero = Q6_V_vzero();
++
++        HVX_Vector out0 = hvx_vec_add_f32_f32(hvx_vmem(dst0 + off), hvx_vec_mul_f32_f32(vs, scale0));
++        HVX_Vector out1 = hvx_vec_add_f32_f32(hvx_vmem(dst1 + off), hvx_vec_mul_f32_f32(vs, scale1));
++        HVX_Vector out2 = hvx_vec_add_f32_f32(hvx_vmem(dst2 + off), hvx_vec_mul_f32_f32(vs, scale2));
++        HVX_Vector out3 = hvx_vec_add_f32_f32(hvx_vmem(dst3 + off), hvx_vec_mul_f32_f32(vs, scale3));
++        HVX_Vector out4 = hvx_vec_add_f32_f32(hvx_vmem(dst4 + off), hvx_vec_mul_f32_f32(vs, scale4));
++        HVX_Vector out5 = hvx_vec_add_f32_f32(hvx_vmem(dst5 + off), hvx_vec_mul_f32_f32(vs, scale5));
++        HVX_Vector out6 = hvx_vec_add_f32_f32(hvx_vmem(dst6 + off), hvx_vec_mul_f32_f32(vs, scale6));
++        HVX_Vector out7 = hvx_vec_add_f32_f32(hvx_vmem(dst7 + off), hvx_vec_mul_f32_f32(vs, scale7));
++
++        hvx_vec_store_u(dst0 + off, nloe * sizeof(float), out0);
++        hvx_vec_store_u(dst1 + off, nloe * sizeof(float), out1);
++        hvx_vec_store_u(dst2 + off, nloe * sizeof(float), out2);
++        hvx_vec_store_u(dst3 + off, nloe * sizeof(float), out3);
++        hvx_vec_store_u(dst4 + off, nloe * sizeof(float), out4);
++        hvx_vec_store_u(dst5 + off, nloe * sizeof(float), out5);
++        hvx_vec_store_u(dst6 + off, nloe * sizeof(float), out6);
++        hvx_vec_store_u(dst7 + off, nloe * sizeof(float), out7);
++
++        acc0 = hvx_vec_add_f32_f32(acc0, Q6_V_vmux_QVV(mask, hvx_vec_mul_f32_f32(out0, vdot), zero));
++        acc1 = hvx_vec_add_f32_f32(acc1, Q6_V_vmux_QVV(mask, hvx_vec_mul_f32_f32(out1, vdot), zero));
++        acc2 = hvx_vec_add_f32_f32(acc2, Q6_V_vmux_QVV(mask, hvx_vec_mul_f32_f32(out2, vdot), zero));
++        acc3 = hvx_vec_add_f32_f32(acc3, Q6_V_vmux_QVV(mask, hvx_vec_mul_f32_f32(out3, vdot), zero));
++        acc4 = hvx_vec_add_f32_f32(acc4, Q6_V_vmux_QVV(mask, hvx_vec_mul_f32_f32(out4, vdot), zero));
++        acc5 = hvx_vec_add_f32_f32(acc5, Q6_V_vmux_QVV(mask, hvx_vec_mul_f32_f32(out5, vdot), zero));
++        acc6 = hvx_vec_add_f32_f32(acc6, Q6_V_vmux_QVV(mask, hvx_vec_mul_f32_f32(out6, vdot), zero));
++        acc7 = hvx_vec_add_f32_f32(acc7, Q6_V_vmux_QVV(mask, hvx_vec_mul_f32_f32(out7, vdot), zero));
++    }
++
++    HVX_Vector_x4 accA = { .v = { acc0, acc1, acc2, acc3 } };
++    HVX_Vector_x4 accB = { .v = { acc4, acc5, acc6, acc7 } };
++    HVX_Vector rA = hvx_vec_reduce_sum_f32x4(accA);
++    HVX_Vector rB = hvx_vec_reduce_sum_f32x4(accB);
++    HVX_VectorPred q16 = Q6_Q_vsetq2_R(16);
++    return Q6_V_vmux_QVV(q16, rA, Q6_V_vror_VR(rB, 128 - 16));
++}
++
+ static inline void gdn_step_kda_f32(
+     float * restrict s_work,
+     float * restrict attn_out,
+@@ -610,6 +894,33 @@ static inline void gdn_step_kda_f32(
+     float delta[8] __attribute__((aligned(128)));
+ 
+     uint32_t j = 0;
++    const bool rows_aligned = (((uintptr_t) s_work) & 127u) == 0 && (S_v % 32) == 0;   // x-elite port
++    if (rows_aligned) {
++    for (; j + 8 <= S_v; j += 8) {
++        float * row0 = s_work + (uint64_t) (j + 0) * S_v;
++        float * row1 = s_work + (uint64_t) (j + 1) * S_v;
++        float * row2 = s_work + (uint64_t) (j + 2) * S_v;
++        float * row3 = s_work + (uint64_t) (j + 3) * S_v;
++        float * row4 = s_work + (uint64_t) (j + 4) * S_v;
++        float * row5 = s_work + (uint64_t) (j + 5) * S_v;
++        float * row6 = s_work + (uint64_t) (j + 6) * S_v;
++        float * row7 = s_work + (uint64_t) (j + 7) * S_v;
++
++        HVX_Vector vsums = gdn_mul_dot8_f32_a(row0, row1, row2, row3, row4, row5, row6, row7,
++                                            vg, vk, S_v);
++
++        HVX_Vector vv_t   = hvx_vmemu(v_t + j);
++        HVX_Vector diff   = hvx_vec_sub_f32_f32(vv_t, vsums);
++        HVX_Vector vdelta = hvx_vec_mul_f32_f32(diff, vbeta);
++        hvx_vec_store_u(delta, 8 * sizeof(float), vdelta);
++
++        HVX_Vector vattn = gdn_add_scaled_dot8_f32_a(row0, row1, row2, row3, row4, row5, row6, row7,
++                                                   vk, delta, vq, S_v);
++
++        HVX_Vector res_attn = hvx_vec_mul_f32_f32(vattn, vscale);
++        hvx_vec_store_u(attn_out + j, 8 * sizeof(float), res_attn);
++    }
++    } else {
+     for (; j + 8 <= S_v; j += 8) {
+         float * row0 = s_work + (uint64_t) (j + 0) * S_v;
+         float * row1 = s_work + (uint64_t) (j + 1) * S_v;
+@@ -634,6 +945,7 @@ static inline void gdn_step_kda_f32(
+         HVX_Vector res_attn = hvx_vec_mul_f32_f32(vattn, vscale);
+         hvx_vec_store_u(attn_out + j, 8 * sizeof(float), res_attn);
+     }
++    }
+     for (; j + 4 <= S_v; j += 4) {
+         float * row0 = s_work + (uint64_t) (j + 0) * S_v;
+         float * row1 = s_work + (uint64_t) (j + 1) * S_v;
+@@ -696,6 +1008,33 @@ static inline void gdn_step_scalar_f32(
+     float delta[8] __attribute__((aligned(128)));
+ 
+     uint32_t j = 0;
++    const bool rows_aligned = (((uintptr_t) s_work) & 127u) == 0 && (S_v % 32) == 0;   // x-elite port
++    if (rows_aligned) {
++    for (; j + 8 <= S_v; j += 8) {
++        float * row0 = s_work + (uint64_t) (j + 0) * S_v;
++        float * row1 = s_work + (uint64_t) (j + 1) * S_v;
++        float * row2 = s_work + (uint64_t) (j + 2) * S_v;
++        float * row3 = s_work + (uint64_t) (j + 3) * S_v;
++        float * row4 = s_work + (uint64_t) (j + 4) * S_v;
++        float * row5 = s_work + (uint64_t) (j + 5) * S_v;
++        float * row6 = s_work + (uint64_t) (j + 6) * S_v;
++        float * row7 = s_work + (uint64_t) (j + 7) * S_v;
++
++        HVX_Vector vsums = gdn_mul_scalar_dot8_f32_a(row0, row1, row2, row3, row4, row5, row6, row7,
++                                                   vgate, vk, S_v);
++
++        HVX_Vector vv_t   = hvx_vmemu(v_t + j);
++        HVX_Vector diff   = hvx_vec_sub_f32_f32(vv_t, vsums);
++        HVX_Vector vdelta = hvx_vec_mul_f32_f32(diff, vbeta);
++        hvx_vec_store_u(delta, 8 * sizeof(float), vdelta);
++
++        HVX_Vector vattn = gdn_add_scaled_dot8_f32_a(row0, row1, row2, row3, row4, row5, row6, row7,
++                                                   vk, delta, vq, S_v);
++
++        HVX_Vector res_attn = hvx_vec_mul_f32_f32(vattn, vscale);
++        hvx_vec_store_u(attn_out + j, 8 * sizeof(float), res_attn);
++    }
++    } else {
+     for (; j + 8 <= S_v; j += 8) {
+         float * row0 = s_work + (uint64_t) (j + 0) * S_v;
+         float * row1 = s_work + (uint64_t) (j + 1) * S_v;
+@@ -720,6 +1059,7 @@ static inline void gdn_step_scalar_f32(
+         HVX_Vector res_attn = hvx_vec_mul_f32_f32(vattn, vscale);
+         hvx_vec_store_u(attn_out + j, 8 * sizeof(float), res_attn);
+     }
++    }
+     for (; j + 4 <= S_v; j += 4) {
+         float * row0 = s_work + (uint64_t) (j + 0) * S_v;
+         float * row1 = s_work + (uint64_t) (j + 1) * S_v;
+@@ -892,6 +1232,70 @@ static void gated_delta_net_f32_pp_thread(const htp_thread_t * th, unsigned int
      dma_queue_flush(dma_q);
  }
  
@@ -765,7 +1139,7 @@ index 0280f99a4..51cee910c 100644
  static void gated_delta_net_f32_tg_thread(const htp_thread_t * th, unsigned int nth, unsigned int ith, void * data) {
      struct htp_gdn_context * gctx = (struct htp_gdn_context *) data;
      struct htp_ops_context * octx = gctx->octx;
-@@ -920,9 +985,16 @@ static void gated_delta_net_f32_tg_thread(const htp_thread_t * th, unsigned int
+@@ -920,9 +1324,16 @@ static void gated_delta_net_f32_tg_thread(const htp_thread_t * th, unsigned int
  
      dma_queue * dma_q = th->dma_q;
      const struct htp_gdn_vtcm_layout * layout = &gctx->layout;
@@ -784,7 +1158,7 @@ index 0280f99a4..51cee910c 100644
  
      const struct fastdiv_values * fd_H   = &kparams->div_H;
      const struct fastdiv_values * fd_q1  = &kparams->div_q1;
-@@ -930,23 +1002,31 @@ static void gated_delta_net_f32_tg_thread(const htp_thread_t * th, unsigned int
+@@ -930,23 +1341,31 @@ static void gated_delta_net_f32_tg_thread(const htp_thread_t * th, unsigned int
      const struct fastdiv_values * fd_rq3 = &kparams->div_rq3;
      const struct fastdiv_values * fd_rk3 = &kparams->div_rk3;
  
@@ -823,7 +1197,7 @@ index 0280f99a4..51cee910c 100644
  
          // Push fetch
          dma_queue_push(dma_q, dma_make_data(s_work[spad_idx], ps_in),
-@@ -954,14 +1034,16 @@ static void gated_delta_net_f32_tg_thread(const htp_thread_t * th, unsigned int
+@@ -954,14 +1373,16 @@ static void gated_delta_net_f32_tg_thread(const htp_thread_t * th, unsigned int
                         S_v * sizeof(float), S_v);
  
          ir_prefetch += nth;
@@ -842,7 +1216,7 @@ index 0280f99a4..51cee910c 100644
          dma_queue_pop(dma_q);
  
          float * s_work_curr = s_work[curr_spad_idx];
-@@ -983,9 +1065,9 @@ static void gated_delta_net_f32_tg_thread(const htp_thread_t * th, unsigned int
+@@ -983,9 +1404,9 @@ static void gated_delta_net_f32_tg_thread(const htp_thread_t * th, unsigned int
                  (uint64_t) ik3 * k->nb[3] + (uint64_t) ik1 * k->nb[1]);
          const float * v_t = (const float *) ((const uint8_t *) (uintptr_t) v->data +
                  (uint64_t) iv3 * v->nb[3] + (uint64_t) iv1 * v->nb[1]);
@@ -854,7 +1228,7 @@ index 0280f99a4..51cee910c 100644
                  (uint64_t) iv3 * beta->nb[3] + (uint64_t) iv1 * beta->nb[1]);
  
          htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) ir);
-@@ -997,25 +1079,29 @@ static void gated_delta_net_f32_tg_thread(const htp_thread_t * th, unsigned int
+@@ -997,25 +1418,29 @@ static void gated_delta_net_f32_tg_thread(const htp_thread_t * th, unsigned int
          htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) ir);
  
          // Push real write-back
@@ -890,7 +1264,7 @@ index 0280f99a4..51cee910c 100644
      }
      dma_queue_flush(dma_q);
  }
-@@ -2329,7 +2415,7 @@ int op_gated_delta_net(struct htp_ops_context * octx) {
+@@ -2329,7 +2754,7 @@ int op_gated_delta_net(struct htp_ops_context * octx) {
      gctx.row_start = row_start;
      gctx.nrows     = nrows;
  
