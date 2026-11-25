@@ -1,0 +1,3252 @@
+diff --git a/ggml/src/ggml-hexagon/ggml-hexagon.cpp b/ggml/src/ggml-hexagon/ggml-hexagon.cpp
+index c38d0005c..0ba749e3e 100644
+--- a/ggml/src/ggml-hexagon/ggml-hexagon.cpp
++++ b/ggml/src/ggml-hexagon/ggml-hexagon.cpp
+@@ -137,6 +137,15 @@ int    opt_fa_select     = 2; // 2 = HMX -> HVX -> CPU, 1 = HVX -> CPU, 0 = CPU
+ int    opt_fa_split      = 1; // 1 = head-split + team-split when n_kv_heads < N_cores (default), 0 = off
+ int    opt_li_select     = 2; // 2 = HMX -> HVX, 1 = HVX, 0 = CPU (unsupported)
+ int    opt_gdn_select    = 2; // 2 = HMX -> HVX, 1 = HVX, 0 = CPU (unsupported)
++int    opt_gdn_fold      = 1; // decode-time GDN folds: 1 = state-direct + gates, 0 = off (GGML_HEXAGON_GDN_FOLD)
++int    opt_gdn_depth     = 2; // decode GDN: state buffers per HVX thread in the DMA ring, 2 = stock (GGML_HEXAGON_GDN_DEPTH)
++int    opt_gdn_wb        = 0; // decode GDN: 1 = HVX-store state write-back instead of DMA (GGML_HEXAGON_GDN_WB)
++int    opt_mmid_cpu_max_rows = 0; // MUL_MAT_ID with fewer activation rows per expert than this stays on the CPU (GGML_HEXAGON_MMID_CPU_MAX_ROWS), 0 = off
++int    opt_topk_fold     = 0; // ARGSORT + VIEW(first k) solved as TOP_K (GGML_HEXAGON_TOPK_FOLD); default 0: the TOP_K path empties the output on the X Elite (session 5), under investigation
++int    opt_mv_group      = 0; // decode matmul: weight column tiles per DMA descriptor, one ring for all weights of an NX op (GGML_HEXAGON_MV_GROUP); 0 = stock ring (default: grouping only helps the 8192-row NX op and slows every smaller dense op)
++size_t opt_batch_vmem    = 0; // cap on the buffer bytes of one op batch (GGML_HEXAGON_BATCH_VMEM, MiB); 0 = max_vmem
++int    opt_mmid_hmx_min_rows = 0; // MUL_MAT_ID: use HVX below this many activation rows per expert (GGML_HEXAGON_MMID_HMX_MIN_ROWS), 0 = stock
++int    opt_conv_fold     = 1; // decode-time direct ssm-conv fold (CONCAT+CPY+SSM_CONV[+SILU]), 0 = off (GGML_HEXAGON_CONV_FOLD)
+ int    opt_ar_select     = 2; // 2 = fused ALLREDUCE+ADD (default), 1 = unfused ALLREDUCE, 0 = fallback to CPY+FENCE
+ int    opt_ar_scatter    = 1; // 1 = reduce-scatter the fused ALLREDUCE+ADD (default), 0 = full reduction
+ 
+@@ -166,6 +175,15 @@ static const char * status_to_str(uint32_t status) {
+             return "VTCM-TOO-SMALL";
+         case HTP_STATUS_INTERNAL_ERR:
+             return "INTERNAL-ERROR";
++        case HTP_STATUS_CONV_NHVX:    return "CONV-NHVX";
++        case HTP_STATUS_CONV_VTCM:    return "CONV-VTCM";
++        case HTP_STATUS_CONV_T0:      return "CONV-T0-X";
++        case HTP_STATUS_CONV_T1:      return "CONV-T1-OLD";
++        case HTP_STATUS_CONV_T2:      return "CONV-T2-W";
++        case HTP_STATUS_CONV_T3:      return "CONV-T3-NEXT";
++        case HTP_STATUS_CONV_T4:      return "CONV-T4-Y";
++        case HTP_STATUS_CONV_WEIGHT:  return "CONV-WEIGHT-OUT";
++        case HTP_STATUS_CONV_OVERLAP: return "CONV-OVERLAP";
+         default:
+             return "UNKNOWN";
+     }
+@@ -1215,7 +1233,8 @@ struct ggml_hexagon_opbatch {
+     unsigned int n_bufs_max;
+     unsigned int n_tens_max;
+     unsigned int n_ops_max;
+-    size_t       b_vmem_max;
++    size_t       b_vmem_max;   // soft cap: an op that would push a non-empty batch past it starts a new batch
++    size_t       b_vmem_hard;  // session VA budget: the only limit for an op that starts an empty batch
+ 
+     void reset() {
+         n_bufs = 0;
+@@ -1234,7 +1253,8 @@ struct ggml_hexagon_opbatch {
+         n_ops_max  = batch_size;
+         n_tens_max = std::min<size_t>(n_ops_max * 4 + HTP_OP_MAX_INPUTS + HTP_OP_MAX_OUTPUTS, HTP_OP_MAX_TENSORS);
+ 
+-        b_vmem_max = max_vmem;
++        b_vmem_hard = max_vmem;
++        b_vmem_max  = (opt_batch_vmem && opt_batch_vmem < max_vmem) ? opt_batch_vmem : max_vmem;
+ 
+         ops.resize(n_ops_max);
+ 
+@@ -1422,9 +1442,16 @@ struct ggml_hexagon_opbatch {
+             fit_tensor(output);
+         }
+ 
+-        if ((extra_bufs + n_bufs) > n_bufs_max) return false;
+-        if (check_tens && (extra_tens + n_tens) > n_tens_max) return false;
+-        if ((extra_vmem + b_vmem) > b_vmem_max) return false;
++        const size_t vmem_limit = (n_ops == 0) ? b_vmem_hard : b_vmem_max;   // x-elite port (candidate A)
++        if ((extra_bufs + n_bufs) > n_bufs_max || (check_tens && (extra_tens + n_tens) > n_tens_max) ||
++            (extra_vmem + b_vmem) > vmem_limit) {
++            if (n_ops == 0) {   // x-elite port: say why an op cannot start a batch (candidate A tuning)
++                GGML_LOG_ERROR("ggml-hex: op %s does not fit an empty batch: bufs %zu+%u/%u tens %zu+%u/%u vmem %zu+%zu/%zu\n",
++                               htp_format_op(node, HTP_OPFMT_PROF).c_str(), extra_bufs, n_bufs, n_bufs_max,
++                               extra_tens, n_tens, n_tens_max, extra_vmem, b_vmem, vmem_limit);
++            }
++            return false;
++        }
+ 
+         return true;
+     }
+@@ -2440,6 +2467,360 @@ static void ggml_hexagon_graph_repack(const ggml_cgraph * graph, ggml_hexagon_se
+     }
+ }
+ 
++// ---- Decode-time GATED_DELTA_NET folds (ported from the sm8750 decode fusion bundle) ----
++//  * state-direct: GET_ROWS(states, s_copy) -> (RESHAPE) -> GDN src[5] is dropped; the kernel reads the slot itself
++//  * gates: ADD(alpha, dt) -> SOFTPLUS -> MUL(A) feeding g and SIGMOID(beta_raw) feeding beta are computed in-kernel
++// Both apply only to one-token, one-sequence graphs on the HVX recurrent kernel; the dropped ops are marked in
++// `folded` and skipped by graph-compute, the GDN op node gets the extra inputs and HTP_GDN_FLAG_* bits.
++struct htp_gdn_fold {
++    const ggml_tensor * states   = nullptr;
++    const ggml_tensor * idx      = nullptr;
++    const ggml_tensor * alpha    = nullptr;
++    const ggml_tensor * beta_raw = nullptr;
++    const ggml_tensor * dt       = nullptr;
++    const ggml_tensor * A        = nullptr;
++};
++
++static const ggml_tensor * htp_gdn_unwrap_view(const ggml_tensor * t) {
++    while (t && (t->op == GGML_OP_RESHAPE || t->op == GGML_OP_VIEW || t->op == GGML_OP_PERMUTE ||
++                 t->op == GGML_OP_TRANSPOSE) && t->src[0]) {
++        t = t->src[0];
++    }
++    return t;
++}
++
++static bool htp_gdn_tensor_local(const ggml_tensor * t) {
++    return t && t->buffer && ggml_backend_buffer_is_hexagon(t->buffer);
++}
++
++// True if `t` (not a view, not an output) is read only by the `st` chain (views/reshapes down to the GDN node `user`)
++// and by zero-element tensors. llama-graph's build_rs adds a zero-row view + copy of the GET_ROWS output when
++// n_rs == n_seqs; it reads nothing, so it must not block the state fold.
++static bool htp_gdn_only_user(const ggml_cgraph * graph, const ggml_tensor * t, const ggml_tensor * st, const ggml_tensor * user) {
++    if (t->view_src || (t->flags & GGML_TENSOR_FLAG_OUTPUT)) return false;
++    for (int i = 0; i < graph->n_nodes; i++) {
++        const ggml_tensor * n = graph->nodes[i];
++        bool uses = false;
++        for (int s = 0; s < GGML_MAX_SRC; s++) uses |= (n->src[s] == t);
++        if (!uses || n == user) continue;
++        bool on_chain = false;
++        for (const ggml_tensor * x = st; x; x = x->src[0]) { if (x == n) { on_chain = true; break; } if (x == t) break; }
++        if (on_chain) continue;
++        if (ggml_nelements(n) == 0) continue;
++        return false;
++    }
++    return true;
++}
++
++static void htp_gdn_prepass(const ggml_cgraph * graph, const ggml_hexagon_session * sess,
++                            std::vector<char> & folded, std::unordered_map<const ggml_tensor *, htp_gdn_fold> & folds) {
++    if (!opt_gdn_fold) return;
++
++    const int n = graph->n_nodes;
++    std::unordered_map<const ggml_tensor *, int> index;
++    index.reserve(n);
++    for (int i = 0; i < n; i++) index[graph->nodes[i]] = i;
++
++    auto node_index = [&](const ggml_tensor * t, int before) -> int {
++        auto it = index.find(t);
++        return (it == index.end() || it->second >= before) ? -1 : it->second;
++    };
++
++    for (int gi = 0; gi < n; gi++) {
++        const ggml_tensor * gdn = graph->nodes[gi];
++        if (gdn->op != GGML_OP_GATED_DELTA_NET || !ggml_hexagon_op_is_compute(gdn)) continue;
++        const ggml_tensor * v  = gdn->src[2];
++        const ggml_tensor * g  = gdn->src[3];
++        const ggml_tensor * b  = gdn->src[4];
++        const ggml_tensor * st = gdn->src[5];
++        if (!v || !g || !b || !st) continue;
++        if (v->ne[2] != 1 || v->ne[3] != 1) continue;   // one token, one sequence
++
++        // the kernel must be the HVX recurrent, non-KDA path
++        {
++            htp_opnode probe(HTP_OP_GATED_DELTA_NET, gdn);
++            if (!htp_kparams_solve(sess, probe)) continue;
++            const auto * kp = probe.kparams<htp_gdn_kernel_params>();
++            if (kp->kernel_type != HTP_GDN_KERNEL_HVX_RECURRENT || kp->kda) continue;
++        }
++
++        htp_gdn_fold f;
++
++        // gates
++        do {
++            const int64_t H = v->ne[1];
++            if (H > 32 || g->ne[0] != 1) break;
++            const ggml_tensor * mul = htp_gdn_unwrap_view(g);
++            const ggml_tensor * sig = htp_gdn_unwrap_view(b);
++            if (!mul || mul->op != GGML_OP_MUL) break;
++            if (!sig || sig->op != GGML_OP_UNARY || ggml_get_unary_op(sig) != GGML_UNARY_OP_SIGMOID) break;
++            const ggml_tensor * sp = mul->src[0];
++            const ggml_tensor * A  = mul->src[1];
++            if (!sp || !A || sp->op != GGML_OP_UNARY || ggml_get_unary_op(sp) != GGML_UNARY_OP_SOFTPLUS) break;
++            const ggml_tensor * add = sp->src[0];
++            if (!add || add->op != GGML_OP_ADD) break;
++            const ggml_tensor * alpha = add->src[0];
++            const ggml_tensor * dt    = add->src[1];
++            const ggml_tensor * braw  = sig->src[0];
++            if (!alpha || !dt || !braw) break;
++            bool ok = true;
++            for (const ggml_tensor * t : { mul, sp, add, sig, alpha, dt, A, braw }) {
++                if (t->type != GGML_TYPE_F32 || ggml_nelements(t) != H) ok = false;
++            }
++            if (!ok) break;
++            if (dt->ne[0] != H || A->ne[0] != H || alpha->nb[0] != sizeof(float) || braw->nb[0] != sizeof(float)) break;
++            if (!(alpha->ne[0] == H || alpha->ne[1] == H) || !(braw->ne[0] == H || braw->ne[1] == H)) break;
++            if (!htp_gdn_tensor_local(alpha) || !htp_gdn_tensor_local(dt) ||
++                !htp_gdn_tensor_local(A)     || !htp_gdn_tensor_local(braw)) break;
++            const int ia = node_index(add, gi), is = node_index(sp, gi), im = node_index(mul, gi), ig = node_index(sig, gi);
++            if (ia < 0 || is < 0 || im < 0 || ig < 0) break;
++            if (!ggml_node_has_n_uses(graph, ia, 1) || !ggml_node_has_n_uses(graph, is, 1) ||
++                !ggml_node_has_n_uses(graph, im, 1) || !ggml_node_has_n_uses(graph, ig, 1)) break;
++            f.alpha = alpha; f.beta_raw = braw; f.dt = dt; f.A = A;
++            folded[ia] = folded[is] = folded[im] = folded[ig] = 1;
++        } while (0);
++
++        // state-direct
++        do {
++            const ggml_tensor * gr = htp_gdn_unwrap_view(st);
++            if (!gr || gr->op != GGML_OP_GET_ROWS) break;
++            const int gri = node_index(gr, gi);
++            if (gri < 0) break;
++            const ggml_tensor * states = gr->src[0];
++            const ggml_tensor * idx    = gr->src[1];
++            if (!states || !idx || states->type != GGML_TYPE_F32 || idx->type != GGML_TYPE_I32 || gr->type != GGML_TYPE_F32) break;
++            if (states->ne[2] != 1 || states->ne[3] != 1 || states->nb[0] != sizeof(float) ||
++                states->nb[1] != (size_t) states->ne[0] * sizeof(float)) break;
++            if (idx->ne[1] != 1 || idx->ne[2] != 1 || idx->ne[3] != 1 || idx->nb[0] != sizeof(int32_t)) break;
++            if (!htp_gdn_only_user(graph, gr, st, gdn)) break;   // zero-row extra-state copy allowed
++            // every view/reshape between the GET_ROWS and the GDN node is read once (ggml_node_has_n_uses rejects
++            // views outright, which is why the state fold never matched)
++            {
++                bool chain_ok = true;
++                for (const ggml_tensor * x = st; x && x != gr; x = x->src[0]) {
++                    const int xi = node_index(x, gi);
++                    if (xi < 0 || ggml_node_get_use_count(graph, xi) != 1 || (x->flags & GGML_TENSOR_FLAG_OUTPUT)) { chain_ok = false; break; }
++                }
++                if (!chain_ok) break;
++            }
++            if (!htp_gdn_tensor_local(states) || !htp_gdn_tensor_local(idx)) break;
++            const int64_t D = st->ne[0] * st->ne[1] * st->ne[2];
++            if (D != states->ne[0] || st->ne[3] != v->ne[3] || idx->ne[0] < v->ne[3]) break;
++            f.states = states; f.idx = idx;
++            folded[gri] = 1;
++        } while (0);
++
++        if (f.alpha || f.states) {
++            folds[gdn] = f;
++        }
++    }
++}
++
++static void htp_gdn_apply_fold(htp_opnode & node, const htp_gdn_fold & f) {
++    auto * kp = node.kparams<htp_gdn_kernel_params>();
++    node.inputs.n = f.alpha ? 9 : 7;   // htp_opvec: slots 6..8 are nullptr until assigned below
++    for (size_t i = 6; i < node.inputs.n; i++) node.inputs[i] = nullptr;
++    if (f.states) {
++        node.inputs[5] = f.states;
++        node.inputs[6] = f.idx;
++        kp->flags |= HTP_GDN_FLAG_STATE_DIRECT;
++    } else {
++        node.inputs[6] = node.inputs[5];   // placeholder, unused without the flag
++    }
++    if (f.alpha) {
++        node.inputs[3] = f.alpha;
++        node.inputs[4] = f.beta_raw;
++        node.inputs[7] = f.dt;
++        node.inputs[8] = f.A;
++        kp->flags |= HTP_GDN_FLAG_GATES;
++    }
++}
++
++// ---- Decode-time SSM_CONV_DIRECT fold ----
++// GET_ROWS(cache_r) -> old; CONCAT(old, x^T) -> cat; CPY(cat[1:], cache_r slot); SSM_CONV(cat, w) -> y; [SILU(y)]
++// becomes one op that reads old/x/w, writes the next state into the cache slot and y (with SiLU) directly.
++// The model graph pins old and x on the SSM_CONV node as src[2]/src[3] (see src/models/qwen35*.cpp).
++struct htp_conv_fold {
++    const ggml_tensor * x     = nullptr;
++    const ggml_tensor * old   = nullptr;
++    const ggml_tensor * w     = nullptr;
++    const ggml_tensor * next  = nullptr;   // CPY node: the recurrent-cache slot view
++    const ggml_tensor * y_out = nullptr;   // y, or the SILU output when folded
++    const ggml_tensor * cpy   = nullptr;
++    const ggml_tensor * silu  = nullptr;
++    uint32_t n_hvx = 0;
++    uint32_t vtcm  = 0;
++};
++
++static bool htp_conv_ranges_overlap(const ggml_tensor * a, const ggml_tensor * b) {
++    if (!a || !b || !a->data || !b->data) return false;
++    const uintptr_t a0 = (uintptr_t) a->data, a1 = a0 + ggml_nbytes(a);
++    const uintptr_t b0 = (uintptr_t) b->data, b1 = b0 + ggml_nbytes(b);
++    return a0 < b1 && b0 < a1;
++}
++
++// ---- x-elite port (T1): ARGSORT(desc) + VIEW(first k) -> TOP_K ----
++// llama.cpp's ggml_argsort_top_k is an ARGSORT followed by a view of the first k columns; the DSP sorts the whole
++// row with a scalar quicksort (3 us per row of 256). When the view is the argsort's only user, the op is solved and
++// dispatched as TOP_K with that k: only the first k indices of each row (what the view reads) are written, with the
++// argsort's own row stride. Ties: the quicksort and the top-k scan order equal values differently.
++static void htp_topk_prepass(const ggml_cgraph * graph, std::unordered_map<const ggml_tensor *, int> & topk) {
++    if (!opt_topk_fold) return;
++    for (int i = 0; i < graph->n_nodes; ++i) {
++        const ggml_tensor * n = graph->nodes[i];
++        if (n->op != GGML_OP_ARGSORT || (n->flags & GGML_TENSOR_FLAG_OUTPUT)) continue;
++        if (((const int32_t *) n->op_params)[0] != GGML_SORT_ORDER_DESC) continue;
++        if (ggml_node_get_use_count(graph, i) != 1) continue;
++        const ggml_tensor * view = nullptr;
++        for (int j = i + 1; j < graph->n_nodes && !view; ++j) {
++            const ggml_tensor * u = graph->nodes[j];
++            for (int s = 0; s < GGML_MAX_SRC; ++s) {
++                if (u->src[s] == n) { view = u; break; }
++            }
++        }
++        if (!view || view->op != GGML_OP_VIEW || view->view_src != n || view->view_offs != 0) continue;
++        const int64_t k = view->ne[0];
++        if (k < 1 || k > 64 || k >= n->ne[0]) continue;
++        if (view->ne[1] != n->ne[1] || view->ne[2] != n->ne[2] || view->ne[3] != n->ne[3]) continue;
++        if (view->nb[1] != n->nb[1] || view->nb[2] != n->nb[2] || view->nb[3] != n->nb[3] || view->nb[0] != n->nb[0]) continue;
++        topk[n] = (int) k;
++    }
++}
++
++static void htp_conv_prepass(const ggml_cgraph * graph, const ggml_hexagon_session * sess,
++                             std::vector<char> & folded, std::unordered_map<const ggml_tensor *, htp_conv_fold> & folds) {
++    if (!opt_conv_fold) return;
++
++    const int n = graph->n_nodes;
++    std::unordered_map<const ggml_tensor *, int> index;
++    index.reserve(n);
++    for (int i = 0; i < n; i++) index[graph->nodes[i]] = i;
++    auto node_index = [&](const ggml_tensor * t) -> int {
++        auto it = index.find(t);
++        return it == index.end() ? -1 : it->second;
++    };
++    auto shape = [](const ggml_tensor * t, int64_t a, int64_t b) {
++        return t && t->type == GGML_TYPE_F32 && t->ne[0] == a && t->ne[1] == b && t->ne[2] == 1 && t->ne[3] == 1;
++    };
++    auto operand = [&](const ggml_tensor * t, int64_t a, int64_t b) {
++        return shape(t, a, b) && ggml_is_contiguous(t) && htp_gdn_tensor_local(t) &&
++               ((reinterpret_cast<uintptr_t>(t->data) & 127) == 0);
++    };
++
++    const uint32_t sess_n_hvx = htp_session_n_hvx(sess);
++    const size_t   sess_vtcm  = htp_session_vtcm_size(sess);
++
++    for (int yi = 0; yi < n; yi++) {
++        const ggml_tensor * y = graph->nodes[yi];
++        if (y->op != GGML_OP_SSM_CONV || !ggml_hexagon_op_is_compute(y) || !y->src[2] || !y->src[3]) continue;
++        const ggml_tensor * cat = y->src[0];
++        const ggml_tensor * w   = y->src[1];
++        const ggml_tensor * old = y->src[2];
++        const ggml_tensor * x   = y->src[3];
++        const int64_t C = y->ne[0];
++        const int64_t T = y->ne[1];
++        if (T < 1 || T > HTP_SSM_DIRECT_MAX_T || C <= 0 || (C % HTP_SSM_DIRECT_SLICE) != 0 || y->ne[2] != 1) continue;
++        if (!operand(y, C, T) || !operand(x, C, T) || !operand(old, 3, C) || !operand(w, 4, C) ||
++            !operand(cat, T + 3, C) || cat->op != GGML_OP_CONCAT || cat->view_src ||
++            ggml_get_op_params_i32(cat, 0) != 0 || cat->src[0] != old || cat->src[2]) continue;
++        const ggml_tensor * xt = cat->src[1];
++        if (!xt || xt->op != GGML_OP_TRANSPOSE || xt->src[0] != x || xt->ne[0] != T || xt->ne[1] != C ||
++            xt->data != x->data || xt->nb[0] != x->nb[1] || xt->nb[1] != x->nb[0]) continue;
++        const int ci = node_index(cat);
++        if (ci < 0 || ci >= yi) continue;
++
++        // the state write-back: CPY(view(cat, [3, C] at +T floats), cache slot)
++        htp_conv_fold f;
++        int cpi = -1;
++        for (int k = ci + 1; k < yi; k++) {
++            const ggml_tensor * cp = graph->nodes[k];
++            if (cp->op != GGML_OP_CPY || !cp->src[0] || !cp->src[1]) continue;
++            const ggml_tensor * sv = cp->src[0];
++            if (sv->op != GGML_OP_VIEW || sv->view_src != cat || sv->view_offs != (size_t) T * sizeof(float) ||
++                sv->type != GGML_TYPE_F32 || sv->ne[0] != 3 || sv->ne[1] != C || sv->ne[2] != 1 || sv->ne[3] != 1 ||
++                sv->nb[0] != sizeof(float) || sv->nb[1] != cat->nb[1]) continue;
++            const ggml_tensor * dstv = cp->src[1];
++            if (!shape(dstv, 3 * C, 1) || !ggml_is_contiguous(dstv) || !htp_gdn_tensor_local(dstv) ||
++                cp->type != GGML_TYPE_F32 || cp->data != dstv->data || ggml_nbytes(cp) != ggml_nbytes(dstv) ||
++                ((reinterpret_cast<uintptr_t>(cp->data) & 127) != 0)) continue;
++            cpi = k;
++            f.next = cp;
++            f.cpy  = cp;
++            break;
++        }
++        if (cpi < 0) continue;
++        if (!ggml_node_has_n_uses(graph, ci, 2)) continue;   // the conv and the write-back view
++
++        // nothing else between the concat and the conv may touch these buffers
++        bool clean = true;
++        for (int k = ci + 1; k < yi && clean; k++) {
++            const ggml_tensor * t = graph->nodes[k];
++            if (k == cpi || (t->op == GGML_OP_VIEW && t->view_src == cat)) continue;
++            if (!ggml_hexagon_op_is_compute(t)) continue;
++            if (htp_conv_ranges_overlap(t, cat) || htp_conv_ranges_overlap(t, f.next) ||
++                htp_conv_ranges_overlap(t, old) || htp_conv_ranges_overlap(t, x)) clean = false;
++            for (int si = 0; si < GGML_MAX_SRC && clean; si++) {
++                const ggml_tensor * sv = t->src[si];
++                if (sv && (htp_conv_ranges_overlap(sv, cat) || htp_conv_ranges_overlap(sv, f.next))) clean = false;
++            }
++        }
++        if (!clean) continue;
++        // y may alias x exactly (ggml-alloc reuses x's bytes; the kernel reads each x slice before writing its y slice)
++        auto same_bytes = [](const ggml_tensor * a, const ggml_tensor * b) {
++            return a->data == b->data && ggml_nbytes(a) == ggml_nbytes(b);
++        };
++        if (htp_conv_ranges_overlap(f.next, old) || htp_conv_ranges_overlap(f.next, x) || htp_conv_ranges_overlap(f.next, w) ||
++            htp_conv_ranges_overlap(y, old) || (htp_conv_ranges_overlap(y, x) && !same_bytes(y, x)) ||
++            htp_conv_ranges_overlap(y, w) || htp_conv_ranges_overlap(y, f.next)) {
++            HEX_VERBOSE("ggml-hex: %s conv-fold skip %s: output overlaps an input\n", sess->c_name(), y->name);
++            continue;
++        }
++
++        // optional SiLU on y
++        f.y_out = y;
++        if (ggml_node_has_n_uses(graph, yi, 1)) {
++            for (int k = yi + 1; k < n && k <= yi + 2; k++) {
++                const ggml_tensor * sn = graph->nodes[k];
++                if (sn->op == GGML_OP_UNARY && ggml_get_unary_op(sn) == GGML_UNARY_OP_SILU && sn->src[0] == y &&
++                    ggml_hexagon_op_is_compute(sn) && ggml_are_same_layout(y, sn) && htp_gdn_tensor_local(sn) &&
++                    ((reinterpret_cast<uintptr_t>(sn->data) & 127) == 0) &&
++                    (!htp_conv_ranges_overlap(sn, x) || same_bytes(sn, x)) && !htp_conv_ranges_overlap(sn, w) &&
++                    !htp_conv_ranges_overlap(sn, old) && !htp_conv_ranges_overlap(sn, f.next)) {
++                    f.silu  = sn;
++                    f.y_out = sn;
++                    folded[k] = 1;
++                    break;
++                }
++            }
++        }
++
++        const uint32_t n_hvx = std::min<uint32_t>(sess_n_hvx, (uint32_t) (C / HTP_SSM_DIRECT_SLICE));
++        const uint64_t vtcm  = (uint64_t) n_hvx * htp_ssm_direct_vtcm_bytes_per_thread((uint32_t) T);
++        if (n_hvx == 0 || vtcm > sess_vtcm) { if (f.silu) folded[node_index(f.silu)] = 0; continue; }
++
++        f.x = x; f.old = old; f.w = w; f.n_hvx = n_hvx; f.vtcm = (uint32_t) vtcm;
++        folded[ci]  = 1;
++        folded[cpi] = 1;
++        folds[y] = f;
++    }
++}
++
++static void htp_conv_apply_fold(htp_opnode & node, const htp_conv_fold & f) {
++    auto * kp = node.kparams<htp_ssm_conv_kernel_params>();
++    kp->n_hvx     = f.n_hvx;
++    kp->vtcm_size = f.vtcm;
++    kp->silu      = f.silu ? 1 : 0;
++    node.inputs.clear();
++    node.inputs.push_back(f.x);
++    node.inputs.push_back(f.old);
++    node.inputs.push_back(f.w);
++    node.outputs.clear();
++    node.outputs.push_back(f.next);
++    node.outputs.push_back(f.y_out);
++    node.fused.push_back(f.cpy);
++    if (f.silu) node.fused.push_back(f.silu);
++}
++
+ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, ggml_cgraph * graph) {
+     auto sess = static_cast<ggml_hexagon_session *>(backend->context);
+ 
+@@ -2462,9 +2843,17 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
+ 
+         computed_nodes.reserve(graph->n_nodes);
+ 
++        std::vector<char> folded(graph->n_nodes, 0);
++        std::unordered_map<const ggml_tensor *, htp_gdn_fold> folds;
++        htp_gdn_prepass(graph, sess, folded, folds);
++        std::unordered_map<const ggml_tensor *, htp_conv_fold> conv_folds;
++        htp_conv_prepass(graph, sess, folded, conv_folds);
++        std::unordered_map<const ggml_tensor *, int> topk_folds;
++        htp_topk_prepass(graph, topk_folds);
++
+         for (int i = 0; i < graph->n_nodes; ++i) {
+             ggml_tensor * n = graph->nodes[i];
+-            if (!ggml_hexagon_op_is_compute(n)) {
++            if (!ggml_hexagon_op_is_compute(n) || folded[i]) {
+                 continue;
+             }
+ 
+@@ -2473,8 +2862,40 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
+                 GGML_ABORT("\nggml-hex: graph-compute %s is not supported\n", ggml_op_desc(n));
+             }
+ 
+-            htp_opnode node(opcode, n);
+-            GGML_ASSERT(htp_kparams_solve(sess, node));
++            const auto tk = (opcode == HTP_OP_ARGSORT) ? topk_folds.find(n) : topk_folds.end();
++            htp_opnode node(tk != topk_folds.end() ? HTP_OP_TOP_K : opcode, n);
++            if (tk != topk_folds.end()) {
++                htp_kparams_sort_topk_override(tk->second);
++                const bool ok = htp_kparams_solve(sess, node);
++                htp_kparams_sort_topk_override(0);
++                GGML_ASSERT(ok);
++                auto d = std::make_shared<ggml_tensor>(*n);   // same buffer, data and strides; ne0 = k for the kernel
++                d->ne[0] = tk->second;
++                node.dummy.push_back(d);
++                node.outputs[0] = d.get();
++                HEX_VERBOSE("ggml-hex: %s topk-fold %s k %d\n", sess->c_name(), n->name, tk->second);
++            } else {
++                GGML_ASSERT(htp_kparams_solve(sess, node));
++            }
++
++            if (opcode == HTP_OP_GATED_DELTA_NET) {
++                auto fit = folds.find(n);
++                if (fit != folds.end()) {
++                    htp_gdn_apply_fold(node, fit->second);
++                    HEX_VERBOSE("ggml-hex: %s gdn-fold %s state-direct %d gates %d\n", sess->c_name(), n->name,
++                                fit->second.states ? 1 : 0, fit->second.alpha ? 1 : 0);
++                }
++            }
++            if (opcode == HTP_OP_SSM_CONV) {
++                auto cit = conv_folds.find(n);
++                if (cit != conv_folds.end()) {
++                    htp_conv_apply_fold(node, cit->second);
++                    HEX_VERBOSE("ggml-hex: %s conv-direct %s n_hvx %u silu %d\n", sess->c_name(), n->name,
++                                cit->second.n_hvx, cit->second.silu ? 1 : 0);
++                } else if (node.inputs.size() > 2) {
++                    node.inputs.n = 2;   // drop the model-graph operand pins; the stock kernel uses src[0:2]
++                }
++            }
+ 
+             computed_nodes.push_back(std::move(node));
+         }
+@@ -3057,6 +3478,19 @@ static bool ggml_backend_hexagon_device_supports_op(ggml_backend_dev_t dev, cons
+         return false;
+     }
+ 
++    // x-elite port (H1): phase-dependent MoE placement. Below GGML_HEXAGON_MMID_CPU_MAX_ROWS activation rows per
++    // expert (decode: 0, 512-token prefill: 16) the expert matmuls are left to the CPU, whose bandwidth beats the
++    // NPU on them; above it (1024 tokens: 32 rows) the HMX path wins and keeps them.
++    if (opt_mmid_cpu_max_rows > 0 && op->op == GGML_OP_MUL_MAT_ID && op->src[0] && op->src[1] && op->src[2]) {
++        const int64_t n_as     = op->src[0]->ne[2];
++        const int64_t n_used   = op->src[2]->ne[0];                              // experts per token (ids rows)
++        const int64_t n_tokens = op->src[1]->ne[2] * op->src[1]->ne[3];          // activations are [k, 1 or n_used, T]
++        const int64_t rows     = n_used * n_tokens;                              // expert-row pairs in this op
++        if (n_as > 0 && rows / n_as < opt_mmid_cpu_max_rows) {
++            return false;
++        }
++    }
++
+     bool supp = false;
+     if (ggml_op_is_empty(op->op) || ggml_is_empty(op)) {
+         supp = true;
+@@ -3468,6 +3902,15 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
+     const char * str_fa_split  = getenv("GGML_HEXAGON_FA_SPLIT");
+     const char * str_li_select = getenv("GGML_HEXAGON_LI_SELECT");
+     const char * str_gdn_select = getenv("GGML_HEXAGON_GDN_SELECT");
++    const char * str_gdn_fold = getenv("GGML_HEXAGON_GDN_FOLD");
++    const char * str_gdn_depth = getenv("GGML_HEXAGON_GDN_DEPTH");
++    const char * str_mv_group = getenv("GGML_HEXAGON_MV_GROUP");
++    const char * str_gdn_wb = getenv("GGML_HEXAGON_GDN_WB");
++    const char * str_topk_fold = getenv("GGML_HEXAGON_TOPK_FOLD");
++    const char * str_mmid_cpu = getenv("GGML_HEXAGON_MMID_CPU_MAX_ROWS");
++    const char * str_conv_fold = getenv("GGML_HEXAGON_CONV_FOLD");
++    const char * str_batch_vmem = getenv("GGML_HEXAGON_BATCH_VMEM");
++    const char * str_mmid_hmx = getenv("GGML_HEXAGON_MMID_HMX_MIN_ROWS");
+     const char * str_ar_select = getenv("GGML_HEXAGON_AR_SELECT");
+     const char * str_ar_scatter = getenv("GGML_HEXAGON_AR_SCATTER");
+     const char * str_ndev     = getenv("GGML_HEXAGON_NDEV");
+@@ -3535,6 +3978,15 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
+     opt_fa_split  = str_fa_split  ? atoi(str_fa_split)                   : opt_fa_split;
+     opt_li_select = str_li_select ? atoi(str_li_select)                   : opt_li_select;
+     opt_gdn_select    = str_gdn_select    ? atoi(str_gdn_select)          : opt_gdn_select;
++    opt_gdn_fold      = str_gdn_fold      ? atoi(str_gdn_fold)            : opt_gdn_fold;
++    opt_gdn_depth     = str_gdn_depth     ? atoi(str_gdn_depth)           : opt_gdn_depth;
++    opt_mv_group      = str_mv_group      ? atoi(str_mv_group)            : opt_mv_group;
++    opt_gdn_wb        = str_gdn_wb        ? atoi(str_gdn_wb)              : opt_gdn_wb;
++    opt_topk_fold     = str_topk_fold     ? atoi(str_topk_fold)           : opt_topk_fold;
++    opt_mmid_cpu_max_rows = str_mmid_cpu  ? atoi(str_mmid_cpu)            : opt_mmid_cpu_max_rows;
++    opt_conv_fold     = str_conv_fold     ? atoi(str_conv_fold)           : opt_conv_fold;
++    opt_batch_vmem    = str_batch_vmem    ? strtoul(str_batch_vmem, NULL, 0) * 1024u * 1024u : opt_batch_vmem;
++    opt_mmid_hmx_min_rows = str_mmid_hmx  ? atoi(str_mmid_hmx)               : opt_mmid_hmx_min_rows;
+     opt_ar_select     = str_ar_select     ? atoi(str_ar_select)           : opt_ar_select;
+     opt_ar_scatter    = str_ar_scatter    ? atoi(str_ar_scatter)          : opt_ar_scatter;
+ 
+diff --git a/ggml/src/ggml-hexagon/htp-common.h b/ggml/src/ggml-hexagon/htp-common.h
+index 4e9e54415..ff8cf13de 100644
+--- a/ggml/src/ggml-hexagon/htp-common.h
++++ b/ggml/src/ggml-hexagon/htp-common.h
+@@ -25,6 +25,15 @@ extern int    opt_fa_select;
+ extern int    opt_fa_split;
+ extern int    opt_li_select;
+ extern int    opt_gdn_select;
++extern int    opt_gdn_fold;
++extern int    opt_gdn_depth;
++extern int    opt_gdn_wb;
++extern int    opt_topk_fold;
++void htp_kparams_sort_topk_override(int k);
++extern int    opt_mv_group;
++extern int    opt_conv_fold;
++extern size_t opt_batch_vmem;
++extern int    opt_mmid_hmx_min_rows;
+ extern int    opt_ar_select;
+ extern int    opt_ar_scatter;
+ 
+diff --git a/ggml/src/ggml-hexagon/htp-fusion.cpp b/ggml/src/ggml-hexagon/htp-fusion.cpp
+index eb0862669..a70ca6ef3 100644
+--- a/ggml/src/ggml-hexagon/htp-fusion.cpp
++++ b/ggml/src/ggml-hexagon/htp-fusion.cpp
+@@ -388,7 +388,10 @@ static bool fuse_ssm_conv_silu(const ggml_hexagon_session * sess, htp_opnode & p
+     if (!htp_match_consumer(prev, cur, /*commutative=*/ false)) return false;
+ 
+     const ggml_tensor * conv_dst = prev.dst();
+-    const ggml_tensor * dst      = cur.dst();
++    // cur.dst() may be a collapsed dummy (htp_opnode_collapse re-rows element-wise unary ops
++    // for the HVX threads, e.g. 8192x1 -> 512x16 in one-token graphs); compare and chain the
++    // real graph tensor so the fused conv keeps its own layout.
++    const ggml_tensor * dst      = cur.node;
+     if (!ggml_are_same_layout(conv_dst, dst)) return false;
+     if (htp_tensors_overlap(dst, prev.src0()) || htp_tensors_overlap(dst, prev.src1())) return false;
+ 
+diff --git a/ggml/src/ggml-hexagon/htp-kparams.cpp b/ggml/src/ggml-hexagon/htp-kparams.cpp
+index 2fbd419ac..8f5f1c23f 100644
+--- a/ggml/src/ggml-hexagon/htp-kparams.cpp
++++ b/ggml/src/ggml-hexagon/htp-kparams.cpp
+@@ -567,6 +567,7 @@ static bool htp_kparams_solve_gated_delta_net(
+     struct htp_gdn_hmx_vtcm_layout hmx_layout;
+     struct htp_gdn_vtcm_layout hvx_layout;
+     uint32_t n_heads_batch = 1;
++    uint32_t gdn_depth = (opt_gdn_depth < 2) ? 2 : ((opt_gdn_depth > 8) ? 8 : (uint32_t) opt_gdn_depth);
+ 
+     if (can_use_hmx && htp_gdn_hmx_solve_layout(&hmx_layout, (uint32_t) S_v, HTP_GDN_CHUNK_SIZE, total_rows, vtcm_size, n_hvx, true, &n_heads_batch)) {
+         kparams->kernel_type   = HTP_GDN_KERNEL_HMX_CHUNKED;
+@@ -576,7 +577,11 @@ static bool htp_kparams_solve_gated_delta_net(
+         kparams->n_heads_batch = (uint16_t) n_heads_batch;
+         kparams->vtcm_size     = (uint32_t) hmx_layout.total_bytes;
+     } else {
+-        htp_gdn_vtcm_layout_build(&hvx_layout, (uint32_t) S_v, n_hvx);
++        htp_gdn_vtcm_layout_build(&hvx_layout, (uint32_t) S_v, n_hvx, gdn_depth);
++        while (hvx_layout.total_bytes > vtcm_size && gdn_depth > 2) {
++            gdn_depth--;
++            htp_gdn_vtcm_layout_build(&hvx_layout, (uint32_t) S_v, n_hvx, gdn_depth);
++        }
+         if (hvx_layout.total_bytes > vtcm_size) {
+             return false;
+         }
+@@ -587,6 +592,8 @@ static bool htp_kparams_solve_gated_delta_net(
+     }
+ 
+     kparams->n_hvx               = n_hvx;
++    kparams->prefetch_depth      = gdn_depth;
++    if (opt_gdn_wb) kparams->flags |= HTP_GDN_FLAG_HVX_WB;
+     kparams->S_v                 = (uint32_t) S_v;
+     kparams->H                   = (uint32_t) H;
+     kparams->n_tokens            = (uint32_t) n_tokens;
+@@ -802,6 +809,7 @@ static void htp_kparams_solve_hvx_mm(
+                 return;
+             }
+             kparams->n_prefetch     = best_n_prefetch;
++            kparams->mv_group     = (uint8_t) ((opt_mv_group < 0) ? 0 : ((opt_mv_group > 16) ? 16 : opt_mv_group));
+             kparams->vtcm_size      = L.total_bytes;
+             kparams->vtcm_bias_size = 0;
+             return;
+@@ -831,6 +839,7 @@ static void htp_kparams_solve_hvx_mm(
+                         dst->nb[1], src0->nb[1], src1->nb[1], src2_row_size, best_n_prefetch, vtcm_budget,
+                         &L, &m_chunk)) {
+                     kparams->n_prefetch     = best_n_prefetch;
++                    kparams->mv_group     = (uint8_t) ((opt_mv_group < 0) ? 0 : ((opt_mv_group > 16) ? 16 : opt_mv_group));
+                     kparams->m_chunk        = (m_chunk < (uint32_t) src1_nrows) ? m_chunk : 0;
+                     kparams->vtcm_size      = L.total_bytes;
+                     kparams->vtcm_bias_size = L.bias_bytes;
+@@ -866,6 +875,7 @@ static void htp_kparams_solve_hvx_mm(
+             kparams->vtcm_size      = L.total_bytes;
+             kparams->vtcm_bias_size = L.bias_bytes;
+             kparams->n_prefetch     = 16;
++            kparams->mv_group     = (uint8_t) ((opt_mv_group < 0) ? 0 : ((opt_mv_group > 16) ? 16 : opt_mv_group));
+             return;
+         }
+     }
+@@ -904,7 +914,12 @@ static bool htp_kparams_solve_matmul_impl(
+     const bool   is_batched   = (ne02 * ne03 > 1 || ne12 * ne13 > 1);
+     const size_t vtcm_budget  = htp_session_vtcm_size(sess);
+ 
+-    const bool hmx_enabled = (htp_session_n_hmx(sess) > 0) && (opt_mm_select >= 2);
++    // x-elite port (P3): MUL_MAT_ID on HMX dequantizes every selected expert's whole weight to fp16 to multiply its
++    // (on average n_tokens * n_expert_used / n_expert) rows; below GGML_HEXAGON_MMID_HMX_MIN_ROWS rows per expert
++    // keep the HVX kernels, which read q4_0 directly. 0 = stock behaviour.
++    const int  avg_rows_per_expert = (ne02 > 0) ? (ne11 * ne12 * ne13) / ne02 : ne11;
++    const bool p3_force_hvx = (is_matmul_id || ne02 > 1) && opt_mmid_hmx_min_rows > 0 && avg_rows_per_expert < opt_mmid_hmx_min_rows;
++    const bool hmx_enabled = (htp_session_n_hmx(sess) > 0) && (opt_mm_select >= 2) && !p3_force_hvx;
+     if (hmx_enabled && htp_matmul_is_hmx_eligible(src0, src1, dst, is_matmul_id, is_batched)) {
+         if (htp_kparams_solve_hmx_mm(sess, src0, src1, dst, wtype, ne00_padded, ne01_tiled, ne02, ne11, ne12, ne11_padded, is_matmul_id, is_batched, src2_size, vtcm_budget, kparams)) {
+             goto finalize;
+@@ -914,6 +929,7 @@ static bool htp_kparams_solve_matmul_impl(
+     htp_kparams_solve_hvx_mm(sess, src0, src1, dst, wtype, is_tiled, ne02, ne03, ne10, ne11, ne12, ne13, is_matmul_id, src2_row_size, vtcm_budget, kparams);
+ 
+ finalize:
++    kparams->mv_group     = (uint8_t) ((opt_mv_group < 0) ? 0 : ((opt_mv_group > 16) ? 16 : opt_mv_group));   // every path (HMX too): MoE prefill mode / dense grouping
+     kparams->div_ne12_ne1 = init_fastdiv_values(ne12 * ne11);
+     kparams->div_ne1      = init_fastdiv_values(ne11);
+     kparams->div_r2       = init_fastdiv_values(ne02 > 0 ? ne12 / ne02 : 1);
+@@ -1118,7 +1134,12 @@ bool htp_kparams_solve_mmnx(
+     const int  ne01_tiled  = hex_round_up(ne01, 32);
+     const bool is_batched  = (ne02 * ne03 > 1 || ne12 * ne13 > 1);
+ 
+-    const bool hmx_enabled = (n_hmx > 0) && (opt_mm_select >= 2);
++    // x-elite port (P3): the HMX path dequantizes every selected expert's whole weight to fp16 before multiplying its
++    // (on average n_tokens * n_expert_used / n_expert) rows; below GGML_HEXAGON_MMID_HMX_MIN_ROWS rows per expert
++    // the HVX kernels, which read q4_0 directly, are expected to be faster. 0 = stock behaviour.
++    const int  avg_rows_per_expert = ne02 > 0 ? (ne11 * ne12 * ne13) / ne02 : ne11;
++    const bool hmx_enabled = (n_hmx > 0) && (opt_mm_select >= 2) &&
++                             !(ne02 > 1 && opt_mmid_hmx_min_rows > 0 && avg_rows_per_expert < opt_mmid_hmx_min_rows);
+     if (hmx_enabled && htp_matmul_is_hmx_eligible(src0, act, nullptr, false, is_batched)) {
+         if (htp_kparams_solve_hmx_mm(sess, src0, act, nullptr, wtype, ne00_padded, ne01_tiled, ne02, ne11, ne12, ne11_padded, false, is_batched, 0, vtcm_budget, kparams)) {
+             kparams->n_weights = n_weights;
+@@ -1136,7 +1157,9 @@ bool htp_kparams_solve_mmnx(
+         const size_t act_row_size  = htp_mm_tiled_act_row_size(wtype, ne10);
+         const size_t src0_row_size = src0->nb[1];
+ 
+-        const uint32_t max_prefetch = (act_nrows > HTP_MM_HMX_MIN_NROWS) ? 2 : 16;
++        // x-elite-35b port: for MUL_MAT_ID the activation rows are n_expert_used x tokens; the vector kernel streams one
++        // row per expert, so the prefetch depth is decided by the token count (decode: ne12 * ne13 == 1 -> 16 deep).
++        const uint32_t max_prefetch = ((uint32_t) (ne12 * ne13) > HTP_MM_HMX_MIN_NROWS) ? 2 : 16;
+         uint32_t best_n_prefetch = 2;
+         for (uint32_t d = max_prefetch; d >= 2; d /= 2) {
+             struct htp_mm_hvx_vtcm_layout L;
+@@ -1164,6 +1187,7 @@ bool htp_kparams_solve_mmnx(
+             kparams->vtcm_bias_size    = 0;
+             kparams->vtcm_size         = L.total_bytes;
+             kparams->n_prefetch        = best_n_prefetch;
++            kparams->mv_group        = (uint8_t) ((opt_mv_group < 0) ? 0 : ((opt_mv_group > 16) ? 16 : opt_mv_group));
+             kparams->n_weights         = n_weights;
+         } else {
+             kparams->kernel_type = HTP_MM_KERNEL_UNSUPPORTED;
+@@ -1172,6 +1196,7 @@ bool htp_kparams_solve_mmnx(
+     }
+ 
+ finalize:
++    kparams->mv_group     = (uint8_t) ((opt_mv_group < 0) ? 0 : ((opt_mv_group > 16) ? 16 : opt_mv_group));   // every path (HMX too): MoE prefill mode / dense grouping
+     kparams->div_ne12_ne1 = init_fastdiv_values(ne12 * ne11);
+     kparams->div_ne1      = init_fastdiv_values(ne11);
+     kparams->div_r2       = init_fastdiv_values(ne02 > 0 ? ne12 / ne02 : 1);
+@@ -2239,6 +2264,10 @@ static bool htp_kparams_solve_ssm_conv(
+     return L.total_bytes <= vtcm_size;
+ }
+ 
++// x-elite port (T1): an ARGSORT whose only user is a VIEW of its first k columns is solved as TOP_K with this k
++static int g_htp_sort_topk_override = 0;
++void htp_kparams_sort_topk_override(int k) { g_htp_sort_topk_override = k; }
++
+ static bool htp_kparams_solve_sort(
+     const struct ggml_hexagon_session * sess,
+     const struct ggml_tensor * op,
+@@ -2248,7 +2277,7 @@ static bool htp_kparams_solve_sort(
+ 
+     const struct ggml_tensor * src0 = op->src[0];
+     const struct ggml_tensor * dst  = op;
+-    const bool is_top_k             = (op->op == GGML_OP_TOP_K);
++    const bool is_top_k             = (op->op == GGML_OP_TOP_K) || g_htp_sort_topk_override > 0;
+ 
+     if (src0->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_I32) {
+         return false;
+@@ -2256,7 +2285,7 @@ static bool htp_kparams_solve_sort(
+ 
+     const uint32_t total_rows    = src0->ne[1] * src0->ne[2] * src0->ne[3];
+     const uint32_t ne00          = src0->ne[0];
+-    const uint32_t k             = dst->ne[0];
++    const uint32_t k             = g_htp_sort_topk_override > 0 ? (uint32_t) g_htp_sort_topk_override : (uint32_t) dst->ne[0];
+     const uint32_t n_hvx_max     = htp_session_n_hvx(sess) > 0 ? htp_session_n_hvx(sess) : 4;
+     const size_t   vtcm_budget   = htp_session_vtcm_size(sess) > 0 ? htp_session_vtcm_size(sess) : (8 * 1024 * 1024);
+ 
+diff --git a/ggml/src/ggml-hexagon/htp-repack.cpp b/ggml/src/ggml-hexagon/htp-repack.cpp
+index d2e3df2cf..04b391e91 100644
+--- a/ggml/src/ggml-hexagon/htp-repack.cpp
++++ b/ggml/src/ggml-hexagon/htp-repack.cpp
+@@ -48,6 +48,31 @@ static inline void transpose_tile_to_nibbles(uint8_t tile_quants[32][32], const
+     }
+ }
+ 
++
++// x-elite port B3: q4_0 tile nibble layout. Vector i (bytes 128i..128i+127), byte[4*row + j] = k 8i+j (low nibble)
++// | k 8i+4+j (high nibble), so the DSP kernels unpack with a mask and a shift instead of a byte transpose.
++static inline void transpose_nibbles_to_tile_q4v2(uint8_t * tile_dst, const uint8_t tile_quants[32][32]) {
++    for (int i = 0; i < 4; i++) {
++        for (int row = 0; row < 32; row++) {
++            for (int j = 0; j < 4; j++) {
++                tile_dst[i * 128 + row * 4 + j] = (uint8_t) (tile_quants[row][8 * i + j] | (tile_quants[row][8 * i + 4 + j] << 4));
++            }
++        }
++    }
++}
++
++static inline void transpose_tile_to_nibbles_q4v2(uint8_t tile_quants[32][32], const uint8_t * tile_src) {
++    for (int i = 0; i < 4; i++) {
++        for (int row = 0; row < 32; row++) {
++            for (int j = 0; j < 4; j++) {
++                const uint8_t val = tile_src[i * 128 + row * 4 + j];
++                tile_quants[row][8 * i + j]     = val & 0x0F;
++                tile_quants[row][8 * i + 4 + j] = val >> 4;
++            }
++        }
++    }
++}
++
+ #if defined(__ARM_NEON) || defined(__aarch64__)
+ static void repack_neon_transpose8x8(const uint8x8_t rows[8], uint8x8_t columns[8]) {
+     const uint8x8x2_t t0 = vtrn_u8(rows[0], rows[1]);
+@@ -440,7 +465,7 @@ static void repack_q4_0_tiled(ggml_tensor * t, const void * data, size_t offset,
+         [](uint8_t * tile_dst, const block_q4_0 * src_slice, int64_t ne0, int64_t ne1, int64_t row_stride, int ct, int kt) {
+             ggml_half * scale_dst = (ggml_half *) (tile_dst + 512);
+ #if defined(__ARM_NEON) || defined(__aarch64__)
+-            if (ct * 32 + 32 <= ne1 && kt < ne0 / 32) {
++            if (false && ct * 32 + 32 <= ne1 && kt < ne0 / 32) {   // B3: NEON path writes the old layout
+                 for (int row0 = 0; row0 < 32; row0 += 8) {
+                     const uint8_t * qs[8];
+                     for (int rr = 0; rr < 8; ++rr) {
+@@ -467,7 +492,7 @@ static void repack_q4_0_tiled(ggml_tensor * t, const void * data, size_t offset,
+                     scale_dst[row] = 0;
+                 }
+             }
+-            transpose_nibbles_to_tile(tile_dst, tile_quants);
++            transpose_nibbles_to_tile_q4v2(tile_dst, tile_quants);
+         });
+ }
+ 
+@@ -475,7 +500,7 @@ static void repack_tiled_q4_0(void * data, const ggml_tensor * t, size_t offset,
+     unpack_from_tiled_grid_32<block_q4_0, 1>(data, t, offset, size, HTP_TENSOR_TILE_SIZE_Q4_0,
+         [](block_q4_0 * dst_slice, const uint8_t * tile_src, int64_t ne0, int64_t start_row, int64_t end_row, int64_t row_stride, int ct, int kt) {
+             uint8_t tile_quants[32][32];
+-            transpose_tile_to_nibbles(tile_quants, tile_src);
++            transpose_tile_to_nibbles_q4v2(tile_quants, tile_src);
+             const ggml_half * scale_src = (const ggml_half *) (tile_src + 512);
+             for (int row = 0; row < 32; row++) {
+                 const int64_t r = ct * 32 + row;
+diff --git a/ggml/src/ggml-hexagon/htp/gated-delta-net-ops.c b/ggml/src/ggml-hexagon/htp/gated-delta-net-ops.c
+index 0280f99a4..109f4cb37 100644
+--- a/ggml/src/ggml-hexagon/htp/gated-delta-net-ops.c
++++ b/ggml/src/ggml-hexagon/htp/gated-delta-net-ops.c
+@@ -8,6 +8,7 @@
+ #include "hvx-copy.h"
+ #include "hvx-reduce.h"
+ #include "hvx-exp.h"
++#include "hvx-sigmoid.h"
+ #include "dma-queue.h"
+ #include "ggml-common.h"
+ #include "htp-ctx.h"
+@@ -574,6 +575,289 @@ static inline HVX_Vector gdn_add_scaled_dot8_f32(float * restrict dst0, float *
+     return Q6_V_vmux_QVV(q16, rA, Q6_V_vror_VR(rB, 128 - 16));
+ }
+ 
++// x-elite port: aligned-row variant (state rows in VTCM, S_v % 32 == 0): same arithmetic, aligned vector loads/stores
++static inline HVX_Vector gdn_mul_dot8_f32_a(float * restrict dst0, float * restrict dst1,
++        float * restrict dst2, float * restrict dst3, float * restrict dst4,
++        float * restrict dst5, float * restrict dst6, float * restrict dst7,
++        const HVX_Vector * restrict mul, const HVX_Vector * restrict dot, uint32_t n) {
++    HVX_Vector acc0 = Q6_V_vzero();
++    HVX_Vector acc1 = Q6_V_vzero();
++    HVX_Vector acc2 = Q6_V_vzero();
++    HVX_Vector acc3 = Q6_V_vzero();
++    HVX_Vector acc4 = Q6_V_vzero();
++    HVX_Vector acc5 = Q6_V_vzero();
++    HVX_Vector acc6 = Q6_V_vzero();
++    HVX_Vector acc7 = Q6_V_vzero();
++
++    const uint32_t epv = 128 / sizeof(float);
++    const uint32_t nvec = n / epv;
++    const uint32_t nloe = n % epv;
++    for (uint32_t i = 0; i < nvec; ++i) {
++        HVX_Vector vm   = mul[i];
++        HVX_Vector vdot = dot[i];
++
++        HVX_Vector out0 = hvx_vec_mul_f32_f32(hvx_vmem(dst0 + i * epv), vm);
++        HVX_Vector out1 = hvx_vec_mul_f32_f32(hvx_vmem(dst1 + i * epv), vm);
++        HVX_Vector out2 = hvx_vec_mul_f32_f32(hvx_vmem(dst2 + i * epv), vm);
++        HVX_Vector out3 = hvx_vec_mul_f32_f32(hvx_vmem(dst3 + i * epv), vm);
++        HVX_Vector out4 = hvx_vec_mul_f32_f32(hvx_vmem(dst4 + i * epv), vm);
++        HVX_Vector out5 = hvx_vec_mul_f32_f32(hvx_vmem(dst5 + i * epv), vm);
++        HVX_Vector out6 = hvx_vec_mul_f32_f32(hvx_vmem(dst6 + i * epv), vm);
++        HVX_Vector out7 = hvx_vec_mul_f32_f32(hvx_vmem(dst7 + i * epv), vm);
++
++        hvx_vmem(dst0 + i * epv) = out0;
++        hvx_vmem(dst1 + i * epv) = out1;
++        hvx_vmem(dst2 + i * epv) = out2;
++        hvx_vmem(dst3 + i * epv) = out3;
++        hvx_vmem(dst4 + i * epv) = out4;
++        hvx_vmem(dst5 + i * epv) = out5;
++        hvx_vmem(dst6 + i * epv) = out6;
++        hvx_vmem(dst7 + i * epv) = out7;
++
++        acc0 = hvx_vec_add_f32_f32(acc0, hvx_vec_mul_f32_f32(out0, vdot));
++        acc1 = hvx_vec_add_f32_f32(acc1, hvx_vec_mul_f32_f32(out1, vdot));
++        acc2 = hvx_vec_add_f32_f32(acc2, hvx_vec_mul_f32_f32(out2, vdot));
++        acc3 = hvx_vec_add_f32_f32(acc3, hvx_vec_mul_f32_f32(out3, vdot));
++        acc4 = hvx_vec_add_f32_f32(acc4, hvx_vec_mul_f32_f32(out4, vdot));
++        acc5 = hvx_vec_add_f32_f32(acc5, hvx_vec_mul_f32_f32(out5, vdot));
++        acc6 = hvx_vec_add_f32_f32(acc6, hvx_vec_mul_f32_f32(out6, vdot));
++        acc7 = hvx_vec_add_f32_f32(acc7, hvx_vec_mul_f32_f32(out7, vdot));
++    }
++
++    if (nloe) {
++        const uint32_t off = nvec * epv;
++        HVX_Vector vm = mul[nvec];
++        HVX_Vector vdot = dot[nvec];
++        HVX_VectorPred mask = Q6_Q_vsetq2_R(nloe * sizeof(float));
++        HVX_Vector zero = Q6_V_vzero();
++
++        HVX_Vector out0 = hvx_vec_mul_f32_f32(hvx_vmem(dst0 + off), vm);
++        HVX_Vector out1 = hvx_vec_mul_f32_f32(hvx_vmem(dst1 + off), vm);
++        HVX_Vector out2 = hvx_vec_mul_f32_f32(hvx_vmem(dst2 + off), vm);
++        HVX_Vector out3 = hvx_vec_mul_f32_f32(hvx_vmem(dst3 + off), vm);
++        HVX_Vector out4 = hvx_vec_mul_f32_f32(hvx_vmem(dst4 + off), vm);
++        HVX_Vector out5 = hvx_vec_mul_f32_f32(hvx_vmem(dst5 + off), vm);
++        HVX_Vector out6 = hvx_vec_mul_f32_f32(hvx_vmem(dst6 + off), vm);
++        HVX_Vector out7 = hvx_vec_mul_f32_f32(hvx_vmem(dst7 + off), vm);
++
++        hvx_vec_store_u(dst0 + off, nloe * sizeof(float), out0);
++        hvx_vec_store_u(dst1 + off, nloe * sizeof(float), out1);
++        hvx_vec_store_u(dst2 + off, nloe * sizeof(float), out2);
++        hvx_vec_store_u(dst3 + off, nloe * sizeof(float), out3);
++        hvx_vec_store_u(dst4 + off, nloe * sizeof(float), out4);
++        hvx_vec_store_u(dst5 + off, nloe * sizeof(float), out5);
++        hvx_vec_store_u(dst6 + off, nloe * sizeof(float), out6);
++        hvx_vec_store_u(dst7 + off, nloe * sizeof(float), out7);
++
++        acc0 = hvx_vec_add_f32_f32(acc0, Q6_V_vmux_QVV(mask, hvx_vec_mul_f32_f32(out0, vdot), zero));
++        acc1 = hvx_vec_add_f32_f32(acc1, Q6_V_vmux_QVV(mask, hvx_vec_mul_f32_f32(out1, vdot), zero));
++        acc2 = hvx_vec_add_f32_f32(acc2, Q6_V_vmux_QVV(mask, hvx_vec_mul_f32_f32(out2, vdot), zero));
++        acc3 = hvx_vec_add_f32_f32(acc3, Q6_V_vmux_QVV(mask, hvx_vec_mul_f32_f32(out3, vdot), zero));
++        acc4 = hvx_vec_add_f32_f32(acc4, Q6_V_vmux_QVV(mask, hvx_vec_mul_f32_f32(out4, vdot), zero));
++        acc5 = hvx_vec_add_f32_f32(acc5, Q6_V_vmux_QVV(mask, hvx_vec_mul_f32_f32(out5, vdot), zero));
++        acc6 = hvx_vec_add_f32_f32(acc6, Q6_V_vmux_QVV(mask, hvx_vec_mul_f32_f32(out6, vdot), zero));
++        acc7 = hvx_vec_add_f32_f32(acc7, Q6_V_vmux_QVV(mask, hvx_vec_mul_f32_f32(out7, vdot), zero));
++    }
++
++    HVX_Vector_x4 accA = { .v = { acc0, acc1, acc2, acc3 } };
++    HVX_Vector_x4 accB = { .v = { acc4, acc5, acc6, acc7 } };
++    HVX_Vector rA = hvx_vec_reduce_sum_f32x4(accA);
++    HVX_Vector rB = hvx_vec_reduce_sum_f32x4(accB);
++    HVX_VectorPred q16 = Q6_Q_vsetq2_R(16);
++    return Q6_V_vmux_QVV(q16, rA, Q6_V_vror_VR(rB, 128 - 16));
++}
++
++// x-elite port: aligned-row variant (state rows in VTCM, S_v % 32 == 0): same arithmetic, aligned vector loads/stores
++static inline HVX_Vector gdn_mul_scalar_dot8_f32_a(float * restrict dst0, float * restrict dst1,
++        float * restrict dst2, float * restrict dst3, float * restrict dst4,
++        float * restrict dst5, float * restrict dst6, float * restrict dst7,
++        HVX_Vector vmul, const HVX_Vector * restrict dot, uint32_t n) {
++    HVX_Vector acc0 = Q6_V_vzero();
++    HVX_Vector acc1 = Q6_V_vzero();
++    HVX_Vector acc2 = Q6_V_vzero();
++    HVX_Vector acc3 = Q6_V_vzero();
++    HVX_Vector acc4 = Q6_V_vzero();
++    HVX_Vector acc5 = Q6_V_vzero();
++    HVX_Vector acc6 = Q6_V_vzero();
++    HVX_Vector acc7 = Q6_V_vzero();
++
++    const uint32_t epv = 128 / sizeof(float);
++    const uint32_t nvec = n / epv;
++    const uint32_t nloe = n % epv;
++    for (uint32_t i = 0; i < nvec; ++i) {
++        HVX_Vector vdot = dot[i];
++
++        HVX_Vector out0 = hvx_vec_mul_f32_f32(hvx_vmem(dst0 + i * epv), vmul);
++        HVX_Vector out1 = hvx_vec_mul_f32_f32(hvx_vmem(dst1 + i * epv), vmul);
++        HVX_Vector out2 = hvx_vec_mul_f32_f32(hvx_vmem(dst2 + i * epv), vmul);
++        HVX_Vector out3 = hvx_vec_mul_f32_f32(hvx_vmem(dst3 + i * epv), vmul);
++        HVX_Vector out4 = hvx_vec_mul_f32_f32(hvx_vmem(dst4 + i * epv), vmul);
++        HVX_Vector out5 = hvx_vec_mul_f32_f32(hvx_vmem(dst5 + i * epv), vmul);
++        HVX_Vector out6 = hvx_vec_mul_f32_f32(hvx_vmem(dst6 + i * epv), vmul);
++        HVX_Vector out7 = hvx_vec_mul_f32_f32(hvx_vmem(dst7 + i * epv), vmul);
++
++        hvx_vmem(dst0 + i * epv) = out0;
++        hvx_vmem(dst1 + i * epv) = out1;
++        hvx_vmem(dst2 + i * epv) = out2;
++        hvx_vmem(dst3 + i * epv) = out3;
++        hvx_vmem(dst4 + i * epv) = out4;
++        hvx_vmem(dst5 + i * epv) = out5;
++        hvx_vmem(dst6 + i * epv) = out6;
++        hvx_vmem(dst7 + i * epv) = out7;
++
++        acc0 = hvx_vec_add_f32_f32(acc0, hvx_vec_mul_f32_f32(out0, vdot));
++        acc1 = hvx_vec_add_f32_f32(acc1, hvx_vec_mul_f32_f32(out1, vdot));
++        acc2 = hvx_vec_add_f32_f32(acc2, hvx_vec_mul_f32_f32(out2, vdot));
++        acc3 = hvx_vec_add_f32_f32(acc3, hvx_vec_mul_f32_f32(out3, vdot));
++        acc4 = hvx_vec_add_f32_f32(acc4, hvx_vec_mul_f32_f32(out4, vdot));
++        acc5 = hvx_vec_add_f32_f32(acc5, hvx_vec_mul_f32_f32(out5, vdot));
++        acc6 = hvx_vec_add_f32_f32(acc6, hvx_vec_mul_f32_f32(out6, vdot));
++        acc7 = hvx_vec_add_f32_f32(acc7, hvx_vec_mul_f32_f32(out7, vdot));
++    }
++
++    if (nloe) {
++        const uint32_t off = nvec * epv;
++        HVX_Vector vdot = dot[nvec];
++        HVX_VectorPred mask = Q6_Q_vsetq2_R(nloe * sizeof(float));
++        HVX_Vector zero = Q6_V_vzero();
++
++        HVX_Vector out0 = hvx_vec_mul_f32_f32(hvx_vmem(dst0 + off), vmul);
++        HVX_Vector out1 = hvx_vec_mul_f32_f32(hvx_vmem(dst1 + off), vmul);
++        HVX_Vector out2 = hvx_vec_mul_f32_f32(hvx_vmem(dst2 + off), vmul);
++        HVX_Vector out3 = hvx_vec_mul_f32_f32(hvx_vmem(dst3 + off), vmul);
++        HVX_Vector out4 = hvx_vec_mul_f32_f32(hvx_vmem(dst4 + off), vmul);
++        HVX_Vector out5 = hvx_vec_mul_f32_f32(hvx_vmem(dst5 + off), vmul);
++        HVX_Vector out6 = hvx_vec_mul_f32_f32(hvx_vmem(dst6 + off), vmul);
++        HVX_Vector out7 = hvx_vec_mul_f32_f32(hvx_vmem(dst7 + off), vmul);
++
++        hvx_vec_store_u(dst0 + off, nloe * sizeof(float), out0);
++        hvx_vec_store_u(dst1 + off, nloe * sizeof(float), out1);
++        hvx_vec_store_u(dst2 + off, nloe * sizeof(float), out2);
++        hvx_vec_store_u(dst3 + off, nloe * sizeof(float), out3);
++        hvx_vec_store_u(dst4 + off, nloe * sizeof(float), out4);
++        hvx_vec_store_u(dst5 + off, nloe * sizeof(float), out5);
++        hvx_vec_store_u(dst6 + off, nloe * sizeof(float), out6);
++        hvx_vec_store_u(dst7 + off, nloe * sizeof(float), out7);
++
++        acc0 = hvx_vec_add_f32_f32(acc0, Q6_V_vmux_QVV(mask, hvx_vec_mul_f32_f32(out0, vdot), zero));
++        acc1 = hvx_vec_add_f32_f32(acc1, Q6_V_vmux_QVV(mask, hvx_vec_mul_f32_f32(out1, vdot), zero));
++        acc2 = hvx_vec_add_f32_f32(acc2, Q6_V_vmux_QVV(mask, hvx_vec_mul_f32_f32(out2, vdot), zero));
++        acc3 = hvx_vec_add_f32_f32(acc3, Q6_V_vmux_QVV(mask, hvx_vec_mul_f32_f32(out3, vdot), zero));
++        acc4 = hvx_vec_add_f32_f32(acc4, Q6_V_vmux_QVV(mask, hvx_vec_mul_f32_f32(out4, vdot), zero));
++        acc5 = hvx_vec_add_f32_f32(acc5, Q6_V_vmux_QVV(mask, hvx_vec_mul_f32_f32(out5, vdot), zero));
++        acc6 = hvx_vec_add_f32_f32(acc6, Q6_V_vmux_QVV(mask, hvx_vec_mul_f32_f32(out6, vdot), zero));
++        acc7 = hvx_vec_add_f32_f32(acc7, Q6_V_vmux_QVV(mask, hvx_vec_mul_f32_f32(out7, vdot), zero));
++    }
++
++    HVX_Vector_x4 accA = { .v = { acc0, acc1, acc2, acc3 } };
++    HVX_Vector_x4 accB = { .v = { acc4, acc5, acc6, acc7 } };
++    HVX_Vector rA = hvx_vec_reduce_sum_f32x4(accA);
++    HVX_Vector rB = hvx_vec_reduce_sum_f32x4(accB);
++    HVX_VectorPred q16 = Q6_Q_vsetq2_R(16);
++    return Q6_V_vmux_QVV(q16, rA, Q6_V_vror_VR(rB, 128 - 16));
++}
++
++// x-elite port: aligned-row variant (state rows in VTCM, S_v % 32 == 0): same arithmetic, aligned vector loads/stores
++static inline HVX_Vector gdn_add_scaled_dot8_f32_a(float * restrict dst0, float * restrict dst1,
++        float * restrict dst2, float * restrict dst3, float * restrict dst4,
++        float * restrict dst5, float * restrict dst6, float * restrict dst7,
++        const HVX_Vector * restrict src, const float * restrict scale,
++        const HVX_Vector * restrict dot, uint32_t n) {
++    HVX_Vector acc0 = Q6_V_vzero();
++    HVX_Vector acc1 = Q6_V_vzero();
++    HVX_Vector acc2 = Q6_V_vzero();
++    HVX_Vector acc3 = Q6_V_vzero();
++    HVX_Vector acc4 = Q6_V_vzero();
++    HVX_Vector acc5 = Q6_V_vzero();
++    HVX_Vector acc6 = Q6_V_vzero();
++    HVX_Vector acc7 = Q6_V_vzero();
++    const HVX_Vector scale0 = hvx_vec_splat_f32(scale[0]);
++    const HVX_Vector scale1 = hvx_vec_splat_f32(scale[1]);
++    const HVX_Vector scale2 = hvx_vec_splat_f32(scale[2]);
++    const HVX_Vector scale3 = hvx_vec_splat_f32(scale[3]);
++    const HVX_Vector scale4 = hvx_vec_splat_f32(scale[4]);
++    const HVX_Vector scale5 = hvx_vec_splat_f32(scale[5]);
++    const HVX_Vector scale6 = hvx_vec_splat_f32(scale[6]);
++    const HVX_Vector scale7 = hvx_vec_splat_f32(scale[7]);
++
++    const uint32_t epv = 128 / sizeof(float);
++    const uint32_t nvec = n / epv;
++    const uint32_t nloe = n % epv;
++    for (uint32_t i = 0; i < nvec; ++i) {
++        HVX_Vector vs   = src[i];
++        HVX_Vector vdot = dot[i];
++
++        HVX_Vector out0 = hvx_vec_add_f32_f32(hvx_vmem(dst0 + i * epv), hvx_vec_mul_f32_f32(vs, scale0));
++        HVX_Vector out1 = hvx_vec_add_f32_f32(hvx_vmem(dst1 + i * epv), hvx_vec_mul_f32_f32(vs, scale1));
++        HVX_Vector out2 = hvx_vec_add_f32_f32(hvx_vmem(dst2 + i * epv), hvx_vec_mul_f32_f32(vs, scale2));
++        HVX_Vector out3 = hvx_vec_add_f32_f32(hvx_vmem(dst3 + i * epv), hvx_vec_mul_f32_f32(vs, scale3));
++        HVX_Vector out4 = hvx_vec_add_f32_f32(hvx_vmem(dst4 + i * epv), hvx_vec_mul_f32_f32(vs, scale4));
++        HVX_Vector out5 = hvx_vec_add_f32_f32(hvx_vmem(dst5 + i * epv), hvx_vec_mul_f32_f32(vs, scale5));
++        HVX_Vector out6 = hvx_vec_add_f32_f32(hvx_vmem(dst6 + i * epv), hvx_vec_mul_f32_f32(vs, scale6));
++        HVX_Vector out7 = hvx_vec_add_f32_f32(hvx_vmem(dst7 + i * epv), hvx_vec_mul_f32_f32(vs, scale7));
++
++        hvx_vmem(dst0 + i * epv) = out0;
++        hvx_vmem(dst1 + i * epv) = out1;
++        hvx_vmem(dst2 + i * epv) = out2;
++        hvx_vmem(dst3 + i * epv) = out3;
++        hvx_vmem(dst4 + i * epv) = out4;
++        hvx_vmem(dst5 + i * epv) = out5;
++        hvx_vmem(dst6 + i * epv) = out6;
++        hvx_vmem(dst7 + i * epv) = out7;
++
++        acc0 = hvx_vec_add_f32_f32(acc0, hvx_vec_mul_f32_f32(out0, vdot));
++        acc1 = hvx_vec_add_f32_f32(acc1, hvx_vec_mul_f32_f32(out1, vdot));
++        acc2 = hvx_vec_add_f32_f32(acc2, hvx_vec_mul_f32_f32(out2, vdot));
++        acc3 = hvx_vec_add_f32_f32(acc3, hvx_vec_mul_f32_f32(out3, vdot));
++        acc4 = hvx_vec_add_f32_f32(acc4, hvx_vec_mul_f32_f32(out4, vdot));
++        acc5 = hvx_vec_add_f32_f32(acc5, hvx_vec_mul_f32_f32(out5, vdot));
++        acc6 = hvx_vec_add_f32_f32(acc6, hvx_vec_mul_f32_f32(out6, vdot));
++        acc7 = hvx_vec_add_f32_f32(acc7, hvx_vec_mul_f32_f32(out7, vdot));
++    }
++
++    if (nloe) {
++        const uint32_t off = nvec * epv;
++        HVX_Vector vs   = src[nvec];
++        HVX_Vector vdot = dot[nvec];
++        HVX_VectorPred mask = Q6_Q_vsetq2_R(nloe * sizeof(float));
++        HVX_Vector zero = Q6_V_vzero();
++
++        HVX_Vector out0 = hvx_vec_add_f32_f32(hvx_vmem(dst0 + off), hvx_vec_mul_f32_f32(vs, scale0));
++        HVX_Vector out1 = hvx_vec_add_f32_f32(hvx_vmem(dst1 + off), hvx_vec_mul_f32_f32(vs, scale1));
++        HVX_Vector out2 = hvx_vec_add_f32_f32(hvx_vmem(dst2 + off), hvx_vec_mul_f32_f32(vs, scale2));
++        HVX_Vector out3 = hvx_vec_add_f32_f32(hvx_vmem(dst3 + off), hvx_vec_mul_f32_f32(vs, scale3));
++        HVX_Vector out4 = hvx_vec_add_f32_f32(hvx_vmem(dst4 + off), hvx_vec_mul_f32_f32(vs, scale4));
++        HVX_Vector out5 = hvx_vec_add_f32_f32(hvx_vmem(dst5 + off), hvx_vec_mul_f32_f32(vs, scale5));
++        HVX_Vector out6 = hvx_vec_add_f32_f32(hvx_vmem(dst6 + off), hvx_vec_mul_f32_f32(vs, scale6));
++        HVX_Vector out7 = hvx_vec_add_f32_f32(hvx_vmem(dst7 + off), hvx_vec_mul_f32_f32(vs, scale7));
++
++        hvx_vec_store_u(dst0 + off, nloe * sizeof(float), out0);
++        hvx_vec_store_u(dst1 + off, nloe * sizeof(float), out1);
++        hvx_vec_store_u(dst2 + off, nloe * sizeof(float), out2);
++        hvx_vec_store_u(dst3 + off, nloe * sizeof(float), out3);
++        hvx_vec_store_u(dst4 + off, nloe * sizeof(float), out4);
++        hvx_vec_store_u(dst5 + off, nloe * sizeof(float), out5);
++        hvx_vec_store_u(dst6 + off, nloe * sizeof(float), out6);
++        hvx_vec_store_u(dst7 + off, nloe * sizeof(float), out7);
++
++        acc0 = hvx_vec_add_f32_f32(acc0, Q6_V_vmux_QVV(mask, hvx_vec_mul_f32_f32(out0, vdot), zero));
++        acc1 = hvx_vec_add_f32_f32(acc1, Q6_V_vmux_QVV(mask, hvx_vec_mul_f32_f32(out1, vdot), zero));
++        acc2 = hvx_vec_add_f32_f32(acc2, Q6_V_vmux_QVV(mask, hvx_vec_mul_f32_f32(out2, vdot), zero));
++        acc3 = hvx_vec_add_f32_f32(acc3, Q6_V_vmux_QVV(mask, hvx_vec_mul_f32_f32(out3, vdot), zero));
++        acc4 = hvx_vec_add_f32_f32(acc4, Q6_V_vmux_QVV(mask, hvx_vec_mul_f32_f32(out4, vdot), zero));
++        acc5 = hvx_vec_add_f32_f32(acc5, Q6_V_vmux_QVV(mask, hvx_vec_mul_f32_f32(out5, vdot), zero));
++        acc6 = hvx_vec_add_f32_f32(acc6, Q6_V_vmux_QVV(mask, hvx_vec_mul_f32_f32(out6, vdot), zero));
++        acc7 = hvx_vec_add_f32_f32(acc7, Q6_V_vmux_QVV(mask, hvx_vec_mul_f32_f32(out7, vdot), zero));
++    }
++
++    HVX_Vector_x4 accA = { .v = { acc0, acc1, acc2, acc3 } };
++    HVX_Vector_x4 accB = { .v = { acc4, acc5, acc6, acc7 } };
++    HVX_Vector rA = hvx_vec_reduce_sum_f32x4(accA);
++    HVX_Vector rB = hvx_vec_reduce_sum_f32x4(accB);
++    HVX_VectorPred q16 = Q6_Q_vsetq2_R(16);
++    return Q6_V_vmux_QVV(q16, rA, Q6_V_vror_VR(rB, 128 - 16));
++}
++
+ static inline void gdn_step_kda_f32(
+     float * restrict s_work,
+     float * restrict attn_out,
+@@ -610,6 +894,33 @@ static inline void gdn_step_kda_f32(
+     float delta[8] __attribute__((aligned(128)));
+ 
+     uint32_t j = 0;
++    const bool rows_aligned = (((uintptr_t) s_work) & 127u) == 0 && (S_v % 32) == 0;   // x-elite port
++    if (rows_aligned) {
++    for (; j + 8 <= S_v; j += 8) {
++        float * row0 = s_work + (uint64_t) (j + 0) * S_v;
++        float * row1 = s_work + (uint64_t) (j + 1) * S_v;
++        float * row2 = s_work + (uint64_t) (j + 2) * S_v;
++        float * row3 = s_work + (uint64_t) (j + 3) * S_v;
++        float * row4 = s_work + (uint64_t) (j + 4) * S_v;
++        float * row5 = s_work + (uint64_t) (j + 5) * S_v;
++        float * row6 = s_work + (uint64_t) (j + 6) * S_v;
++        float * row7 = s_work + (uint64_t) (j + 7) * S_v;
++
++        HVX_Vector vsums = gdn_mul_dot8_f32_a(row0, row1, row2, row3, row4, row5, row6, row7,
++                                            vg, vk, S_v);
++
++        HVX_Vector vv_t   = hvx_vmemu(v_t + j);
++        HVX_Vector diff   = hvx_vec_sub_f32_f32(vv_t, vsums);
++        HVX_Vector vdelta = hvx_vec_mul_f32_f32(diff, vbeta);
++        hvx_vec_store_u(delta, 8 * sizeof(float), vdelta);
++
++        HVX_Vector vattn = gdn_add_scaled_dot8_f32_a(row0, row1, row2, row3, row4, row5, row6, row7,
++                                                   vk, delta, vq, S_v);
++
++        HVX_Vector res_attn = hvx_vec_mul_f32_f32(vattn, vscale);
++        hvx_vec_store_u(attn_out + j, 8 * sizeof(float), res_attn);
++    }
++    } else {
+     for (; j + 8 <= S_v; j += 8) {
+         float * row0 = s_work + (uint64_t) (j + 0) * S_v;
+         float * row1 = s_work + (uint64_t) (j + 1) * S_v;
+@@ -634,6 +945,7 @@ static inline void gdn_step_kda_f32(
+         HVX_Vector res_attn = hvx_vec_mul_f32_f32(vattn, vscale);
+         hvx_vec_store_u(attn_out + j, 8 * sizeof(float), res_attn);
+     }
++    }
+     for (; j + 4 <= S_v; j += 4) {
+         float * row0 = s_work + (uint64_t) (j + 0) * S_v;
+         float * row1 = s_work + (uint64_t) (j + 1) * S_v;
+@@ -696,6 +1008,33 @@ static inline void gdn_step_scalar_f32(
+     float delta[8] __attribute__((aligned(128)));
+ 
+     uint32_t j = 0;
++    const bool rows_aligned = (((uintptr_t) s_work) & 127u) == 0 && (S_v % 32) == 0;   // x-elite port
++    if (rows_aligned) {
++    for (; j + 8 <= S_v; j += 8) {
++        float * row0 = s_work + (uint64_t) (j + 0) * S_v;
++        float * row1 = s_work + (uint64_t) (j + 1) * S_v;
++        float * row2 = s_work + (uint64_t) (j + 2) * S_v;
++        float * row3 = s_work + (uint64_t) (j + 3) * S_v;
++        float * row4 = s_work + (uint64_t) (j + 4) * S_v;
++        float * row5 = s_work + (uint64_t) (j + 5) * S_v;
++        float * row6 = s_work + (uint64_t) (j + 6) * S_v;
++        float * row7 = s_work + (uint64_t) (j + 7) * S_v;
++
++        HVX_Vector vsums = gdn_mul_scalar_dot8_f32_a(row0, row1, row2, row3, row4, row5, row6, row7,
++                                                   vgate, vk, S_v);
++
++        HVX_Vector vv_t   = hvx_vmemu(v_t + j);
++        HVX_Vector diff   = hvx_vec_sub_f32_f32(vv_t, vsums);
++        HVX_Vector vdelta = hvx_vec_mul_f32_f32(diff, vbeta);
++        hvx_vec_store_u(delta, 8 * sizeof(float), vdelta);
++
++        HVX_Vector vattn = gdn_add_scaled_dot8_f32_a(row0, row1, row2, row3, row4, row5, row6, row7,
++                                                   vk, delta, vq, S_v);
++
++        HVX_Vector res_attn = hvx_vec_mul_f32_f32(vattn, vscale);
++        hvx_vec_store_u(attn_out + j, 8 * sizeof(float), res_attn);
++    }
++    } else {
+     for (; j + 8 <= S_v; j += 8) {
+         float * row0 = s_work + (uint64_t) (j + 0) * S_v;
+         float * row1 = s_work + (uint64_t) (j + 1) * S_v;
+@@ -720,6 +1059,7 @@ static inline void gdn_step_scalar_f32(
+         HVX_Vector res_attn = hvx_vec_mul_f32_f32(vattn, vscale);
+         hvx_vec_store_u(attn_out + j, 8 * sizeof(float), res_attn);
+     }
++    }
+     for (; j + 4 <= S_v; j += 4) {
+         float * row0 = s_work + (uint64_t) (j + 0) * S_v;
+         float * row1 = s_work + (uint64_t) (j + 1) * S_v;
+@@ -892,6 +1232,70 @@ static void gated_delta_net_f32_pp_thread(const htp_thread_t * th, unsigned int
+     dma_queue_flush(dma_q);
+ }
+ 
++// ---- decode folds (HTP_GDN_FLAG_*) ----
++static inline dma_addr_t gdn_state_in_addr(const struct htp_tensor * state,
++                                           const struct htp_tensor * state_idx,
++                                           const struct htp_gdn_kernel_params * kp,
++                                           uint32_t piv3, uint32_t piv1, uint32_t S_v) {
++    if (kp->flags & HTP_GDN_FLAG_STATE_DIRECT) {
++        const int32_t * idx = (const int32_t *) (uintptr_t) state_idx->data;
++        return state->data + (uint64_t) idx[piv3] * state->nb[1] + (uint64_t) piv1 * S_v * S_v * sizeof(float);
++    }
++    return state->data + ((uint64_t) piv3 * kp->state_seq_stride + (uint64_t) piv1 * S_v * S_v) * sizeof(float);
++}
++
++static inline float gdn_gate_elem(const struct htp_tensor * t, uint32_t h) {
++    const size_t stride = (t->ne[0] > 1) ? t->nb[0] : t->nb[1];
++    return *(const float *) ((const uint8_t *) (uintptr_t) t->data + (size_t) h * stride);
++}
++
++// Same instruction sequence as hvx_softplus_f32_aa in unary-ops.c (x for x > 20, else log(1 + exp(x))).
++static inline void gdn_softplus_f32_aa(uint8_t * restrict dst, const uint8_t * restrict src, uint32_t n) {
++    const HVX_Vector * restrict v_src = (const HVX_Vector *) src;
++    HVX_Vector * restrict v_dst       = (HVX_Vector *) dst;
++    const HVX_Vector twenty = hvx_vec_splat_f32(20.0f);
++    const HVX_Vector one    = hvx_vec_splat_f32(1.0f);
++    const uint32_t nvec = n / VLEN_FP32;
++    const uint32_t nloe = n % VLEN_FP32;
++    for (uint32_t i = 0; i < nvec; i++) {
++        HVX_Vector x             = v_src[i];
++        HVX_VectorPred pred_gt20 = Q6_Q_vcmp_gt_VsfVsf(x, twenty);
++        HVX_Vector expx          = hvx_vec_exp_f32(x);
++        HVX_Vector logv          = hvx_vec_log_f32(hvx_vec_add_f32_f32(one, expx));
++        v_dst[i]                 = Q6_V_vmux_QVV(pred_gt20, x, logv);
++    }
++    if (nloe > 0) {
++        HVX_Vector x             = v_src[nvec];
++        HVX_VectorPred pred_gt20 = Q6_Q_vcmp_gt_VsfVsf(x, twenty);
++        HVX_Vector expx          = hvx_vec_exp_f32(x);
++        HVX_Vector logv          = hvx_vec_log_f32(hvx_vec_add_f32_f32(one, expx));
++        HVX_Vector sp            = Q6_V_vmux_QVV(pred_gt20, x, logv);
++        hvx_vec_store_a((void *) &v_dst[nvec], nloe * sizeof(float), sp);
++    }
++}
++
++// Per-thread HVX scratch for the fused gates (static: the toolchain does not honour aligned() on stack arrays).
++static float gdn_gate_scratch[HTP_MAX_NTHREADS + 1][8][32] __attribute__((aligned(128)));
++
++// ADD(alpha, dt) -> SOFTPLUS -> MUL(A) and SIGMOID(beta_raw), with the routines the separate ops use.
++static void gdn_compute_gates(const struct htp_ops_context * octx, unsigned int ith, uint32_t H, float ** g_out_p, float ** b_out_p) {
++    float (*sc)[32] = gdn_gate_scratch[ith];
++    float * a = sc[0], * d = sc[1], * aa = sc[2], * br = sc[3], * t1 = sc[4], * t2 = sc[5];
++    float * g_out = sc[6], * b_out = sc[7];
++    *g_out_p = g_out; *b_out_p = b_out;
++    memset(sc, 0, 8 * 32 * sizeof(float));
++    for (uint32_t h = 0; h < H; h++) {
++        a[h]  = gdn_gate_elem(octx->src[3], h);
++        br[h] = gdn_gate_elem(octx->src[4], h);
++        d[h]  = gdn_gate_elem(octx->src[7], h);
++        aa[h] = gdn_gate_elem(octx->src[8], h);
++    }
++    hvx_add_f32_aaa((uint8_t *) t1, (const uint8_t *) a, (const uint8_t *) d, H);
++    gdn_softplus_f32_aa((uint8_t *) t2, (const uint8_t *) t1, H);
++    hvx_mul_f32_aaa((uint8_t *) g_out, (const uint8_t *) t2, (const uint8_t *) aa, H);
++    hvx_sigmoid_f32_aa((uint8_t *) b_out, (const uint8_t *) br, H);
++}
++
+ static void gated_delta_net_f32_tg_thread(const htp_thread_t * th, unsigned int nth, unsigned int ith, void * data) {
+     struct htp_gdn_context * gctx = (struct htp_gdn_context *) data;
+     struct htp_ops_context * octx = gctx->octx;
+@@ -920,9 +1324,16 @@ static void gated_delta_net_f32_tg_thread(const htp_thread_t * th, unsigned int
+ 
+     dma_queue * dma_q = th->dma_q;
+     const struct htp_gdn_vtcm_layout * layout = &gctx->layout;
+-    float * s_work[2];
++    // Ring of `depth` state buffers per thread: fetches for the next depth-1 heads stay queued behind the
++    // current head's write-back (DMA queue is in order), so the DMA engine always has work in flight.
++    uint32_t depth = kparams->prefetch_depth;
++    if (depth < 2) depth = 2;
++    if (depth > HTP_GDN_MAX_DEPTH) depth = HTP_GDN_MAX_DEPTH;
++    float * s_work[HTP_GDN_MAX_DEPTH];
+     s_work[0] = (float *) (gctx->vtcm_base + layout->bytes_per_hvx * ith);
+-    s_work[1] = s_work[0] + layout->state_aligned / sizeof(float);
++    for (uint32_t d = 1; d < depth; d++) {
++        s_work[d] = s_work[0] + (size_t) d * layout->state_aligned / sizeof(float);
++    }
+ 
+     const struct fastdiv_values * fd_H   = &kparams->div_H;
+     const struct fastdiv_values * fd_q1  = &kparams->div_q1;
+@@ -930,23 +1341,31 @@ static void gated_delta_net_f32_tg_thread(const htp_thread_t * th, unsigned int
+     const struct fastdiv_values * fd_rq3 = &kparams->div_rq3;
+     const struct fastdiv_values * fd_rk3 = &kparams->div_rk3;
+ 
+-    const uint32_t state_seq_stride = kparams->state_seq_stride;
++    const bool fused_gates = (kparams->flags & HTP_GDN_FLAG_GATES) != 0;
++    const bool hvx_wb      = (kparams->flags & HTP_GDN_FLAG_HVX_WB) != 0;   // state write-back by vector stores, fetch-only DMA ring
++    float * gate_g = NULL;
++    float * gate_b = NULL;
++    if (fused_gates) {
++        gdn_compute_gates(octx, ith, H, &gate_g, &gate_b);
++    }
+     const dma_addr_t state_out_dma_base = dst_cache ? dst_cache->data : (dst->data + S_v * H * n_seqs * sizeof(float));
+ 
+     uint32_t ir_prefetch = gctx->row_start + ith;
+     int spad_idx = 0;
+ 
+-    // Prefetch preamble (up to 2 steps)
+-    for (int step = 0; step < 2 && ir_prefetch < row_end; step++) {
++    // Prefetch preamble (up to `depth` steps)
++    for (uint32_t step = 0; step < depth && ir_prefetch < row_end; step++) {
+         const uint32_t piv1 = fastmodulo(ir_prefetch, H, fd_H);
+         const uint32_t piv3 = fastdiv(ir_prefetch, fd_H);
+-        dma_addr_t ps_in  = state->data + ((uint64_t) piv3 * state_seq_stride + (uint64_t) piv1 * S_v * S_v) * sizeof(float);
++        dma_addr_t ps_in  = gdn_state_in_addr(state, octx->src[6], kparams, piv3, piv1, S_v);
+         dma_addr_t ps_out = state_out_dma_base + ((uint64_t) piv3 * H + piv1) * S_v * S_v * sizeof(float);
+ 
+         // Push dummy write-back
+-        dma_queue_push(dma_q, dma_make_data(ps_out, s_work[spad_idx]),
+-                       S_v * sizeof(float), S_v * sizeof(float),
+-                       S_v * sizeof(float), 0);
++        if (!hvx_wb) {
++            dma_queue_push(dma_q, dma_make_data(ps_out, s_work[spad_idx]),
++                           S_v * sizeof(float), S_v * sizeof(float),
++                           S_v * sizeof(float), 0);
++        }
+ 
+         // Push fetch
+         dma_queue_push(dma_q, dma_make_data(s_work[spad_idx], ps_in),
+@@ -954,14 +1373,16 @@ static void gated_delta_net_f32_tg_thread(const htp_thread_t * th, unsigned int
+                        S_v * sizeof(float), S_v);
+ 
+         ir_prefetch += nth;
+-        spad_idx ^= 1;
++        spad_idx = (spad_idx + 1 == (int) depth) ? 0 : spad_idx + 1;
+     }
+ 
+     struct htp_thread_trace * tr = th->trace;
+ 
+     int curr_spad_idx = 0;
+     for (uint32_t ir = gctx->row_start + ith; ir < row_end; ir += nth) {
+-        dma_queue_pop(dma_q);
++        if (!hvx_wb) {
++            dma_queue_pop(dma_q);
++        }
+         dma_queue_pop(dma_q);
+ 
+         float * s_work_curr = s_work[curr_spad_idx];
+@@ -983,9 +1404,9 @@ static void gated_delta_net_f32_tg_thread(const htp_thread_t * th, unsigned int
+                 (uint64_t) ik3 * k->nb[3] + (uint64_t) ik1 * k->nb[1]);
+         const float * v_t = (const float *) ((const uint8_t *) (uintptr_t) v->data +
+                 (uint64_t) iv3 * v->nb[3] + (uint64_t) iv1 * v->nb[1]);
+-        const float * g_t = (const float *) ((const uint8_t *) (uintptr_t) g->data +
++        const float * g_t = fused_gates ? &gate_g[iv1] : (const float *) ((const uint8_t *) (uintptr_t) g->data +
+                 (uint64_t) iv3 * g->nb[3] + (uint64_t) iv1 * g->nb[1]);
+-        const float beta_val = *(const float *) ((const uint8_t *) (uintptr_t) beta->data +
++        const float beta_val = fused_gates ? gate_b[iv1] : *(const float *) ((const uint8_t *) (uintptr_t) beta->data +
+                 (uint64_t) iv3 * beta->nb[3] + (uint64_t) iv1 * beta->nb[1]);
+ 
+         htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) ir);
+@@ -997,25 +1418,29 @@ static void gated_delta_net_f32_tg_thread(const htp_thread_t * th, unsigned int
+         htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) ir);
+ 
+         // Push real write-back
+-        dma_queue_push(dma_q, dma_make_data(s_out, s_work_curr),
+-                       S_v * sizeof(float), S_v * sizeof(float),
+-                       S_v * sizeof(float), S_v);
++        if (hvx_wb) {
++            hvx_copy_f32_ua((uint8_t *) (uintptr_t) s_out, (const uint8_t *) s_work_curr, S_v * S_v);
++        } else {
++            dma_queue_push(dma_q, dma_make_data(s_out, s_work_curr),
++                           S_v * sizeof(float), S_v * sizeof(float),
++                           S_v * sizeof(float), S_v);
++        }
+ 
+         // Prefetch next block (if any)
+         if (ir_prefetch < row_end) {
+             const uint32_t piv1 = fastmodulo(ir_prefetch, H, fd_H);
+             const uint32_t piv3 = fastdiv(ir_prefetch, fd_H);
+-            dma_addr_t ps_in = state->data + ((uint64_t) piv3 * state_seq_stride + (uint64_t) piv1 * S_v * S_v) * sizeof(float);
++            dma_addr_t ps_in = gdn_state_in_addr(state, octx->src[6], kparams, piv3, piv1, S_v);
+ 
+             dma_queue_push(dma_q, dma_make_data(s_work[spad_idx], ps_in),
+                            S_v * sizeof(float), S_v * sizeof(float),
+                            S_v * sizeof(float), S_v);
+ 
+             ir_prefetch += nth;
+-            spad_idx ^= 1;
++            spad_idx = (spad_idx + 1 == (int) depth) ? 0 : spad_idx + 1;
+         }
+ 
+-        curr_spad_idx ^= 1;
++        curr_spad_idx = (curr_spad_idx + 1 == (int) depth) ? 0 : curr_spad_idx + 1;
+     }
+     dma_queue_flush(dma_q);
+ }
+@@ -2329,7 +2754,7 @@ int op_gated_delta_net(struct htp_ops_context * octx) {
+     gctx.row_start = row_start;
+     gctx.nrows     = nrows;
+ 
+-    htp_gdn_vtcm_layout_build(&gctx.layout, S_v, n_hvx);
++    htp_gdn_vtcm_layout_build(&gctx.layout, S_v, n_hvx, kparams->prefetch_depth);
+     gctx.vtcm_base = VTCM_LAYOUT_PTR(uint8_t, octx->ctx->vtcm_base, gctx.layout.off_state);
+ 
+     if (gctx.layout.total_bytes > octx->ctx->vtcm_size) {
+diff --git a/ggml/src/ggml-hexagon/htp/gated-delta-net-ops.h b/ggml/src/ggml-hexagon/htp/gated-delta-net-ops.h
+index aff1eb645..97529f235 100644
+--- a/ggml/src/ggml-hexagon/htp/gated-delta-net-ops.h
++++ b/ggml/src/ggml-hexagon/htp/gated-delta-net-ops.h
+@@ -13,6 +13,14 @@
+ #define HTP_GDN_CHUNK_SIZE 64
+ #define HTP_GDN_MIN_TOKENS 8
+ 
++// Decode-time folds (one token, one sequence, HVX recurrent kernel only):
++//  STATE_DIRECT: src[5] is the whole state buffer [D, n_slots], src[6] the i32 slot index (the GET_ROWS copy is dropped)
++//  GATES:        src[3] = alpha, src[4] = beta_raw, src[7] = dt_bias, src[8] = A; g/beta are computed in-kernel
++#define HTP_GDN_FLAG_STATE_DIRECT 1u
++#define HTP_GDN_FLAG_GATES        2u
++#define HTP_GDN_FLAG_HVX_WB       4u   // decode: write the new state back with HVX stores instead of DMA (GGML_HEXAGON_GDN_WB)
++#define HTP_GDN_MAX_DEPTH         8u
++
+ #ifndef HMX_FP16_TILE_SIZE
+ #define HMX_FP16_TILE_SIZE 2048
+ #endif
+@@ -43,6 +51,8 @@ struct htp_gdn_kernel_params {
+     uint32_t state_size_per_snap;
+ 
+     float    scale;
++    uint32_t flags;              // HTP_GDN_FLAG_* (decode folds, see gated-delta-net-ops.c)
++    uint32_t prefetch_depth;     // decode: state buffers per HVX thread in the DMA ring (GGML_HEXAGON_GDN_DEPTH, >= 2)
+ 
+     struct fastdiv_values div_H;
+     struct fastdiv_values div_q1;
+@@ -67,11 +77,13 @@ struct htp_gdn_vtcm_layout {
+ static inline void htp_gdn_vtcm_layout_build(
+     struct htp_gdn_vtcm_layout * L,
+     uint32_t S_v,
+-    uint32_t n_hvx
++    uint32_t n_hvx,
++    uint32_t depth
+ ) {
+     size_t state_bytes = (size_t) S_v * S_v * sizeof(float);
++    if (depth < 2) depth = 2;
+     L->state_aligned = hex_round_up(state_bytes, 128);
+-    L->bytes_per_hvx = 2 * L->state_aligned;
++    L->bytes_per_hvx = (size_t) depth * L->state_aligned;
+     size_t off = 0;
+     VTCM_LAYOUT_ALLOC(off, off_state, L->bytes_per_hvx * n_hvx);
+     L->total_bytes = off;
+diff --git a/ggml/src/ggml-hexagon/htp/hmx-mm-kernels-tiled.h b/ggml/src/ggml-hexagon/htp/hmx-mm-kernels-tiled.h
+index 590167492..57e3c5154 100644
+--- a/ggml/src/ggml-hexagon/htp/hmx-mm-kernels-tiled.h
++++ b/ggml/src/ggml-hexagon/htp/hmx-mm-kernels-tiled.h
+@@ -110,21 +110,20 @@ static void dequantize_tiled_weight_to_fp16_task_q4_0(
+         v_lo3 = Q6_Vb_vsub_VbVb(v_lo3, i8);
+         v_hi3 = Q6_Vb_vsub_VbVb(v_hi3, i8);
+ 
+-        // Shuffling
+-        HVX_VectorPair vp_shuf0 = Q6_W_vshuff_VVR(v_hi0, v_lo0, -1);
+-        HVX_VectorPair vp_shuf1 = Q6_W_vshuff_VVR(v_hi1, v_lo1, -1);
+-        HVX_VectorPair vp_shuf2 = Q6_W_vshuff_VVR(v_hi2, v_lo2, -1);
+-        HVX_VectorPair vp_shuf3 = Q6_W_vshuff_VVR(v_hi3, v_lo3, -1);
+-
+-        // Unpack to 16-bit
+-        HVX_VectorPair vp_int16_lo0 = Q6_Wh_vunpack_Vb(Q6_V_lo_W(vp_shuf0));
+-        HVX_VectorPair vp_int16_hi0 = Q6_Wh_vunpack_Vb(Q6_V_hi_W(vp_shuf0));
+-        HVX_VectorPair vp_int16_lo1 = Q6_Wh_vunpack_Vb(Q6_V_lo_W(vp_shuf1));
+-        HVX_VectorPair vp_int16_hi1 = Q6_Wh_vunpack_Vb(Q6_V_hi_W(vp_shuf1));
+-        HVX_VectorPair vp_int16_lo2 = Q6_Wh_vunpack_Vb(Q6_V_lo_W(vp_shuf2));
+-        HVX_VectorPair vp_int16_hi2 = Q6_Wh_vunpack_Vb(Q6_V_hi_W(vp_shuf2));
+-        HVX_VectorPair vp_int16_lo3 = Q6_Wh_vunpack_Vb(Q6_V_lo_W(vp_shuf3));
+-        HVX_VectorPair vp_int16_hi3 = Q6_Wh_vunpack_Vb(Q6_V_hi_W(vp_shuf3));
++        // x-elite port B3 layout: byte[4*row + j] of group g holds k = 8g+j (low nibble) / 8g+4+j (high nibble).
++        // Sign-extending v_lo gives halfwords [row][k0 k1 k2 k3]; dealing the halfword pairs (words) of that pair puts
++        // column pair cp 0 (k0,k1 of every row) in the low vector and cp 1 (k2,k3) in the high one, which is the
++        // (row-major, k-pair interleaved) order the old byte shuffle produced. Same for v_hi (cp 2, 3).
++#define HTP_Q4V2_PAIRS(v) ({ HVX_VectorPair p_ = Q6_Wh_vunpack_Vb(v); Q6_W_vdeal_VVR(Q6_V_hi_W(p_), Q6_V_lo_W(p_), -4); })
++        HVX_VectorPair vp_int16_lo0 = HTP_Q4V2_PAIRS(v_lo0);
++        HVX_VectorPair vp_int16_hi0 = HTP_Q4V2_PAIRS(v_hi0);
++        HVX_VectorPair vp_int16_lo1 = HTP_Q4V2_PAIRS(v_lo1);
++        HVX_VectorPair vp_int16_hi1 = HTP_Q4V2_PAIRS(v_hi1);
++        HVX_VectorPair vp_int16_lo2 = HTP_Q4V2_PAIRS(v_lo2);
++        HVX_VectorPair vp_int16_hi2 = HTP_Q4V2_PAIRS(v_hi2);
++        HVX_VectorPair vp_int16_lo3 = HTP_Q4V2_PAIRS(v_lo3);
++        HVX_VectorPair vp_int16_hi3 = HTP_Q4V2_PAIRS(v_hi3);
++#undef HTP_Q4V2_PAIRS
+ 
+         // Convert and scale multiplication
+         HVX_Vector v_grp0_0 = Q6_Vhf_equals_Vqf16(Q6_Vqf16_vmpy_VhfVhf(Q6_Vhf_equals_Vh(Q6_V_lo_W(vp_int16_lo0)), v_scale_duplicated));
+@@ -1404,6 +1403,49 @@ static void transfer_activation_row_pair_fp32_to_fp16_col_chunk(
+     }
+ }
+ 
++// x-elite port (M1): the gathered rows were already DMA'd into a VTCM staging area (row r at stage + r * k_block),
++// so the fp32 -> fp16 tile conversion reads VTCM instead of DDR. Same conversion, same tile layout.
++static void transfer_activation_chunk_fp32_to_fp16_staged(
++            __fp16 *restrict vtcm_dst,
++            const float *restrict stage,
++            uint32_t vtcm_start_row,
++            uint32_t n_rows,
++            uint32_t n_rows_valid,
++            uint32_t k_block,
++            uint32_t k_valid) {
++    const uint32_t n_rows_padded = hex_align_up(n_rows, HTP_MM_HMX_TILE_N_ROWS);
++    for (uint32_t r = 0; r < n_rows_padded; r += 2) {
++        const uint32_t lr = vtcm_start_row + r;
++        const uint32_t r0 = lr / HTP_MM_HMX_TILE_N_ROWS;
++        const uint32_t r1 = lr % HTP_MM_HMX_TILE_N_ROWS;
++        const bool v0ok = (r + 0) < n_rows_valid;
++        const bool v1ok = (r + 1) < n_rows_valid;
++        const float * row0 = stage + (size_t) (r + 0) * k_block;
++        const float * row1 = stage + (size_t) (r + 1) * k_block;
++        uint32_t c = 0;
++        for (; c + 32 <= k_valid; c += 32) {
++            HVX_Vector v0 = v0ok ? *(const HVX_Vector *) (row0 + c) : Q6_V_vzero();
++            HVX_Vector v1 = v1ok ? *(const HVX_Vector *) (row1 + c) : Q6_V_vzero();
++            HVX_Vector v_out = hvx_vec_f32_to_f16_shuff(v0, v1);
++            const uint32_t tile_idx = r0 * (k_block / HTP_MM_HMX_TILE_N_COLS) + c / HTP_MM_HMX_TILE_N_COLS;
++            HVX_Vector * tile = (HVX_Vector *) (vtcm_dst + tile_idx * HTP_MM_HMX_TILE_N_ELMS);
++            tile[r1 / 2] = v_out;
++        }
++        if (c < k_block) {
++            HVX_Vector v0 = v0ok ? *(const HVX_Vector *) (row0 + c) : Q6_V_vzero();
++            HVX_Vector v1 = v1ok ? *(const HVX_Vector *) (row1 + c) : Q6_V_vzero();
++            const uint32_t rem = k_valid - c;
++            HVX_VectorPred mask = Q6_Q_vsetq2_R(rem > 0 ? rem * sizeof(float) : 0);
++            v0 = Q6_V_vmux_QVV(mask, v0, Q6_V_vzero());
++            v1 = Q6_V_vmux_QVV(mask, v1, Q6_V_vzero());
++            HVX_Vector v_out = hvx_vec_f32_to_f16_shuff(v0, v1);
++            const uint32_t tile_idx = r0 * (k_block / HTP_MM_HMX_TILE_N_COLS) + c / HTP_MM_HMX_TILE_N_COLS;
++            HVX_Vector * tile = (HVX_Vector *) (vtcm_dst + tile_idx * HTP_MM_HMX_TILE_N_ELMS);
++            tile[r1 / 2] = v_out;
++        }
++    }
++}
++
+ static void transfer_activation_chunk_fp32_to_fp16_gathered(
+             __fp16 *restrict vtcm_dst,
+             const float *restrict src,
+diff --git a/ggml/src/ggml-hexagon/htp/htp-ctx.h b/ggml/src/ggml-hexagon/htp/htp-ctx.h
+index 721fa2162..2e47ac3ff 100644
+--- a/ggml/src/ggml-hexagon/htp/htp-ctx.h
++++ b/ggml/src/ggml-hexagon/htp/htp-ctx.h
+@@ -106,6 +106,9 @@ struct htp_context {
+     atomic_bool            vtcm_needs_release;
+ 
+     uint64_t               max_vmem;
++    uint32_t               mmap_inuse;         // x-elite port (cand. A): mappings used by the batch being computed
++    void *                 prep_stack;         // stack of the prep helper thread (pipelined prep_op_bufs)
++    uint32_t               prep_stack_size;
+     struct htp_dirty_range dirty_ranges[HTP_MAX_DIRTY_RANGES];
+ 
+     // Persistent DDR scratchpad for MUL_MAT_ID mappings
+diff --git a/ggml/src/ggml-hexagon/htp/htp-ops.h b/ggml/src/ggml-hexagon/htp/htp-ops.h
+index 7c4b97307..b7f40a729 100644
+--- a/ggml/src/ggml-hexagon/htp/htp-ops.h
++++ b/ggml/src/ggml-hexagon/htp/htp-ops.h
+@@ -11,6 +11,16 @@ enum htp_status {
+     HTP_STATUS_NO_SUPPORT     = 3,
+     HTP_STATUS_INVAL_PARAMS   = 4,
+     HTP_STATUS_VTCM_TOO_SMALL = 5,
++    // direct ssm-conv (decode fold) parameter checks, reported by name on the host for on-device diagnosis
++    HTP_STATUS_CONV_NHVX      = 16,
++    HTP_STATUS_CONV_VTCM      = 17,
++    HTP_STATUS_CONV_T0        = 18,   // x
++    HTP_STATUS_CONV_T1        = 19,   // old state
++    HTP_STATUS_CONV_T2        = 20,   // weight
++    HTP_STATUS_CONV_T3        = 21,   // next state
++    HTP_STATUS_CONV_T4        = 22,   // y
++    HTP_STATUS_CONV_WEIGHT    = 23,
++    HTP_STATUS_CONV_OVERLAP   = 24,
+ };
+ 
+ // First set of values must match the ggml_type.
+diff --git a/ggml/src/ggml-hexagon/htp/hvx-mm-kernels-tiled.h b/ggml/src/ggml-hexagon/htp/hvx-mm-kernels-tiled.h
+index 01c671679..082a3fbd2 100644
+--- a/ggml/src/ggml-hexagon/htp/hvx-mm-kernels-tiled.h
++++ b/ggml/src/ggml-hexagon/htp/hvx-mm-kernels-tiled.h
+@@ -510,6 +510,55 @@ static inline HVX_VectorPair accum_4bit_32x2(
+     return Q6_W_vcombine_VV(v_sum1, v_sum0);
+ }
+ 
++
++// x-elite port B3: q4_0 tiles use the row-major nibble layout (see repack_q4_0_tiled): vector i, byte[4*row + j] holds
++// k = 8i+j in the low nibble and k = 8i+4+j in the high nibble, so W0 / W1 for vrmpy are a mask and a shift away
++// (no permute-unit ops). The integer dot over the 32-k tile is unchanged, so results are bit-identical to the old path.
++static inline HVX_Vector accum_q4v2_32x1(
++    const HVX_Vector * restrict vptr,
++    const HVX_Vector * restrict v_act,
++    HVX_Vector i8
++) {
++    HVX_Vector v_sum0 = Q6_V_vzero();
++    HVX_Vector v_sum1 = Q6_V_vzero();
++    HVX_Vector mask_h4 = Q6_Vb_vsplat_R(0x0F);
++
++    #pragma unroll
++    for (int i = 0; i < 4; i++) {
++        HVX_Vector v_W0 = Q6_Vb_vsub_VbVb(Q6_V_vand_VV(vptr[i], mask_h4), i8);
++        HVX_Vector v_W1 = Q6_Vb_vsub_VbVb(Q6_Vub_vlsr_VubR(vptr[i], 4), i8);
++        v_sum0 = Q6_Vw_vrmpyacc_VwVbVb(v_sum0, v_W0, v_act[i * 2 + 0]);
++        v_sum1 = Q6_Vw_vrmpyacc_VwVbVb(v_sum1, v_W1, v_act[i * 2 + 1]);
++    }
++
++    return Q6_Vw_vadd_VwVw(v_sum0, v_sum1);
++}
++
++static inline HVX_VectorPair accum_q4v2_32x2(
++    const HVX_Vector * restrict vptr,
++    const HVX_Vector * restrict v_act0,
++    const HVX_Vector * restrict v_act1,
++    HVX_Vector i8
++) {
++    HVX_Vector v_sum0 = Q6_V_vzero();
++    HVX_Vector v_sum1 = Q6_V_vzero();
++    HVX_Vector mask_h4 = Q6_Vb_vsplat_R(0x0F);
++
++    #pragma unroll
++    for (int i = 0; i < 4; i++) {
++        HVX_Vector v_W0 = Q6_Vb_vsub_VbVb(Q6_V_vand_VV(vptr[i], mask_h4), i8);
++        HVX_Vector v_W1 = Q6_Vb_vsub_VbVb(Q6_Vub_vlsr_VubR(vptr[i], 4), i8);
++
++        v_sum0 = Q6_Vw_vrmpyacc_VwVbVb(v_sum0, v_W0, v_act0[i * 2 + 0]);
++        v_sum0 = Q6_Vw_vrmpyacc_VwVbVb(v_sum0, v_W1, v_act0[i * 2 + 1]);
++
++        v_sum1 = Q6_Vw_vrmpyacc_VwVbVb(v_sum1, v_W0, v_act1[i * 2 + 0]);
++        v_sum1 = Q6_Vw_vrmpyacc_VwVbVb(v_sum1, v_W1, v_act1[i * 2 + 1]);
++    }
++
++    return Q6_W_vcombine_VV(v_sum1, v_sum0);
++}
++
+ static inline HVX_VectorPair accum_4bit_32x2_lut(
+     const HVX_Vector * restrict vptr,
+     const HVX_Vector * restrict v_act0,
+@@ -1013,7 +1062,7 @@ static void tiled_vec_dot_q4_0_32x1(const uint32_t n, float * restrict s, const
+         const HVX_Vector * restrict vptr = (const HVX_Vector *) (tile_ptr + kt * 640);
+         const HVX_Vector * restrict v_act = (const HVX_Vector *) (y_q + kt * 1152);
+ 
+-        HVX_Vector v_sum = accum_4bit_32x1(vptr, v_act, i8);
++        HVX_Vector v_sum = accum_q4v2_32x1(vptr, v_act, i8);
+         HVX_Vector v_sum_sf = Q6_Vsf_equals_Vw(v_sum);
+ 
+         HVX_Vector v_scale_w = vptr[4];
+@@ -1046,7 +1095,7 @@ static void tiled_vec_dot_q4_0_32x2(const uint32_t n, float * restrict s0, float
+         const HVX_Vector * restrict v_act0 = (const HVX_Vector *) (y0_q + kt * 1152);
+         const HVX_Vector * restrict v_act1 = (const HVX_Vector *) (y1_q + kt * 1152);
+ 
+-        HVX_VectorPair v_sums = accum_4bit_32x2(vptr, v_act0, v_act1, i8);
++        HVX_VectorPair v_sums = accum_q4v2_32x2(vptr, v_act0, v_act1, i8);
+         HVX_Vector v_sum_c0 = Q6_V_lo_W(v_sums);
+         HVX_Vector v_sum_c1 = Q6_V_hi_W(v_sums);
+ 
+diff --git a/ggml/src/ggml-hexagon/htp/hvx-quant.h b/ggml/src/ggml-hexagon/htp/hvx-quant.h
+index b0ca6ecf6..cd62dddaa 100644
+--- a/ggml/src/ggml-hexagon/htp/hvx-quant.h
++++ b/ggml/src/ggml-hexagon/htp/hvx-quant.h
+@@ -519,12 +519,13 @@ static inline void hvx_dequantize_row_tiled_q4_0_f32(float * dst_spad, const uin
+ 
+         HVX_Vector vq = Q6_V_vzero();
+         for (int group = 3; group >= 0; --group) {
+-            vq = Q6_V_vmux_QVV(first4, hvx_dequantize_gather4(hvx_vmem(tile + group * VLEN), row), Q6_V_vror_VR(vq, VLEN - 4));
++            // B3 layout: the row's 4 bytes of this group are contiguous at byte 4*row
++            vq = Q6_V_vmux_QVV(first4, Q6_V_vror_VR(hvx_vmem(tile + group * VLEN), 4 * row), Q6_V_vror_VR(vq, VLEN - 4));
+         }
+ 
+         const HVX_Vector lo = Q6_V_vand_VV(vq, Q6_Vb_vsplat_R(0x0F));
+         const HVX_Vector hi = Q6_Vub_vlsr_VubR(vq, 4);
+-        vq = Q6_V_lo_W(Q6_W_vshuff_VVR(hi, lo, -1));
++        vq = Q6_V_lo_W(Q6_W_vshuff_VVR(hi, lo, -4));   // B3 layout: k 0..3 are the low nibbles, 4..7 the high ones
+         vq = Q6_Vb_vsub_VbVb(vq, Q6_Vb_vsplat_R(8));
+ 
+         const HVX_Vector scales = hvx_vmem(tile + 512);
+diff --git a/ggml/src/ggml-hexagon/htp/main.c b/ggml/src/ggml-hexagon/htp/main.c
+index ad457d1a6..d93645b35 100644
+--- a/ggml/src/ggml-hexagon/htp/main.c
++++ b/ggml/src/ggml-hexagon/htp/main.c
+@@ -16,6 +16,8 @@
+ #include <qurt.h>
+ #include <qurt_thread.h>
+ #include <qurt_memory.h>
++
++#define PREP_THREAD_STACK_SIZE (64 * 1024)   // x-elite port (candidate A): stack of the htp-prep helper thread
+ #include <remote.h>
+ #include <string.h>
+ #include <stdatomic.h>
+@@ -707,6 +709,9 @@ AEEResult htp_iface_start(remote_handle64 handle, uint32_t sess_id, uint64_t dsp
+         qurt_thread_attr_set_stack_size(&attr, size_main_stack);
+         qurt_thread_attr_set_priority(&attr, main_prio);
+         qurt_thread_attr_set_name(&attr, "htp-main");
++        ctx->prep_stack_size = PREP_THREAD_STACK_SIZE;
++        ctx->prep_stack      = malloc(ctx->prep_stack_size);
++        if (!ctx->prep_stack) { ctx->prep_stack_size = 0; }
+ 
+         int err_thread = qurt_thread_create(&ctx->main_thread, &attr, htp_main_thread, ctx);
+         if (err_thread) {
+@@ -733,6 +738,7 @@ AEEResult htp_iface_stop(remote_handle64 handle) {
+         atomic_store(&ctx->killed, true);
+         int status;
+         (void) qurt_thread_join(ctx->main_thread, &status);
++        if (ctx->prep_stack) { free(ctx->prep_stack); ctx->prep_stack = NULL; ctx->prep_stack_size = 0; }
+         ctx->main_thread = 0;
+     }
+ 
+@@ -1141,7 +1147,43 @@ static inline bool mmap_buf(struct htp_context *ctx, struct htp_buf_desc *b) {
+     return false;
+ }
+ 
+-static void prep_op_bufs(struct htp_context *ctx, struct htp_buf_desc *bufs, uint32_t n_bufs) {
++// Mask of the mappings the given buffers resolve to (after a successful prep).
++static uint32_t bufs_mmap_mask(struct htp_context *ctx, const struct htp_buf_desc *bufs, uint32_t n_bufs) {
++    uint32_t mask = 0;
++    for (uint32_t i = 0; i < n_bufs; i++) {
++        for (uint32_t m = 0; m < HTP_MAX_MMAPS; m++) {
++            if (ctx->mmap[m].size && ctx->mmap[m].fd == bufs[i].fd && ctx->mmap[m].flags == bufs[i].flags) {
++                mask |= (1u << m);
++                break;
++            }
++        }
++    }
++    return mask;
++}
++
++// Can the buffers of a queued batch be mapped next to the `protect`ed (running) mappings without dropping them?
++static bool prep_op_bufs_fit(struct htp_context *ctx, const struct htp_buf_desc *bufs, uint32_t n_bufs, uint32_t protect) {
++    uint64_t need = 0;
++    for (uint32_t i = 0; i < n_bufs; i++) {
++        const struct htp_buf_desc *b = bufs + i;
++        if (b->flags & HTP_BUF_EXTENDED) continue;
++        bool have = false;
++        for (uint32_t m = 0; m < HTP_MAX_MMAPS; m++) {
++            if (ctx->mmap[m].size && ctx->mmap[m].fd == b->fd && ctx->mmap[m].flags == b->flags) { have = true; break; }
++        }
++        if (!have) need += b->size;
++    }
++    uint64_t kept = 0;
++    for (uint32_t m = 0; m < HTP_MAX_MMAPS; m++) {
++        if ((protect & (1u << m)) && !(ctx->mmap[m].flags & HTP_BUF_EXTENDED)) kept += ctx->mmap[m].size;
++    }
++    return (kept + need) <= ctx->max_vmem;
++}
++
++// protect: mappings that must not be dropped (the batch currently computing, when prep runs ahead of it).
++// Returns false only when protect != 0 and the buffers could not be mapped; the caller then retries after the
++// running batch with protect == 0 (which may defragment).
++static bool prep_op_bufs(struct htp_context *ctx, struct htp_buf_desc *bufs, uint32_t n_bufs, uint32_t protect) {
+     uint32_t m_reuse = 0; // mmap reuse mask (index from ctx->mmap array)
+     uint32_t b_reuse = 0; // buf reuse count
+ 
+@@ -1159,7 +1201,7 @@ static void prep_op_bufs(struct htp_context *ctx, struct htp_buf_desc *bufs, uin
+         FARF(HIGH, "prep-buf #%u : pass0 fd %u base 0x%llx size %llu flags 0x%x", i, b->fd, (unsigned long long) b->base, (unsigned long long) b->size, b->flags);
+     }
+ 
+-    if (b_reuse == n_bufs) return; // all bufs reuse existing mappings
++    if (b_reuse == n_bufs) return true; // all bufs reuse existing mappings
+ 
+     // See how much vmem we have mmaped right now
+     for (uint32_t i=0; i<HTP_MAX_MMAPS; i++) {
+@@ -1174,7 +1216,7 @@ static void prep_op_bufs(struct htp_context *ctx, struct htp_buf_desc *bufs, uin
+     if ((m_vmem + e_vmem) > ctx->max_vmem) {
+         // Drop unused mappings
+         for (uint32_t i=0; i < HTP_MAX_MMAPS; i++) {
+-            bool used = m_reuse & (1<<i);
++            bool used = (m_reuse | protect) & (1u<<i);
+             if (!used && !(ctx->mmap[i].flags & HTP_BUF_EXTENDED)) {
+                 drop_mmap(ctx, ctx->mmap + i);
+             }
+@@ -1192,6 +1234,11 @@ static void prep_op_bufs(struct htp_context *ctx, struct htp_buf_desc *bufs, uin
+         FARF(HIGH, "prep-buf #%u : pass1 fd %u base 0x%llx size %llu flags 0x%x", i, b->fd, (unsigned long long) b->base, (unsigned long long) b->size, b->flags);
+     }
+ 
++    if (!mmap_ok && protect) {
++        FARF(HIGH, "prep-bufs : pipelined prep could not map next to the running batch, deferring");
++        return false;
++    }
++
+     if (!mmap_ok) {
+         // Attempt defragmentation: drop 32-bit mappings and remap (pass 2)
+         FARF(HIGH, "prep-bufs : dropping 32-bit mappings to defragment address space");
+@@ -1213,6 +1260,7 @@ static void prep_op_bufs(struct htp_context *ctx, struct htp_buf_desc *bufs, uin
+             FARF(HIGH, "prep-buf #%u : pass2 fd %u base 0x%llx size %llu flags 0x%x", i, b->fd, (unsigned long long) b->base, (unsigned long long) b->size, b->flags);
+         }
+     }
++    return true;
+ }
+ 
+ static void prep_tensor(struct htp_context *ctx, struct htp_buf_desc *bufs, struct htp_tensor *tens, uint32_t idx, struct htp_tensor *t) {
+@@ -1342,7 +1390,8 @@ static void process_opbatch(struct htp_context * ctx, const struct htp_opbatch_r
+     htp_trace_event_stop(&ctx->trace[0], HTP_TRACE_EVT_L2FLUSH, 0);
+ 
+     htp_trace_event_start(&ctx->trace[0], HTP_TRACE_EVT_BUFF, 0);
+-    prep_op_bufs(ctx, bufs, n_bufs);
++    (void) prep_op_bufs(ctx, bufs, n_bufs, 0);
++    ctx->mmap_inuse = bufs_mmap_mask(ctx, bufs, n_bufs);
+     htp_trace_event_stop(&ctx->trace[0], HTP_TRACE_EVT_BUFF, 0);
+ 
+     prep_tensors(ctx, bufs, tens, n_tens);
+@@ -1426,6 +1475,23 @@ static void process_opbatch(struct htp_context * ctx, const struct htp_opbatch_r
+ #define DSPQUEUE_POLL_TIMEOUT_USEC 100
+ #define DSPQUEUE_POLL_COUNT        100
+ 
++// x-elite port (candidate A): while a batch computes, map the buffers of the next queued batch on a helper
++// thread, so the per-batch mmap churn (the 32-bit VA budget cannot hold the 20 GB model) overlaps compute.
++// Only done when the next batch fits next to the running one (host: GGML_HEXAGON_BATCH_VMEM caps batches).
++struct htp_prep_job {
++    struct htp_context *  ctx;
++    struct htp_buf_desc * bufs;
++    uint32_t              n_bufs;
++    uint32_t              protect;
++    volatile int          done;    // 1 = mapped, -1 = deferred
++};
++
++static void prep_thread_fn(void * arg) {
++    struct htp_prep_job * job = (struct htp_prep_job *) arg;
++    job->done = prep_op_bufs(job->ctx, job->bufs, job->n_bufs, job->protect) ? 1 : -1;
++    qurt_thread_exit(0);
++}
++
+ static void process_ops(struct htp_context * ctx) {
+     dspqueue_t queue = ctx->dsp_queue;
+     int err;
+@@ -1434,37 +1500,84 @@ static void process_ops(struct htp_context * ctx) {
+ 
+     vtcm_acquire(ctx);
+ 
+-    while (!atomic_load(&ctx->vtcm_needs_release) && !atomic_load(&ctx->killed)) {
+-        struct htp_opbatch_req req;
+-        uint32_t r_size = sizeof(req);
++    struct htp_opbatch_req  next_req;
++    struct dspqueue_buffer  next_dbuf;
++    bool                    have_next = false;
+ 
++    while (have_next || (!atomic_load(&ctx->vtcm_needs_release) && !atomic_load(&ctx->killed))) {
++        struct htp_opbatch_req req;
+         struct dspqueue_buffer dbuf;
+-        uint32_t n_dbufs = 1;
+-        uint32_t flags   = 0;
+ 
+-        err = dspqueue_read_noblock(queue, &flags, n_dbufs, &n_dbufs, &dbuf, r_size, &r_size, (uint8_t *) &req);
+-        if (err == AEE_EWOULDBLOCK) {
+-            if (--poll_count) {
+-                qurt_sleep(DSPQUEUE_POLL_TIMEOUT_USEC);
++        if (have_next) {
++            req  = next_req;
++            dbuf = next_dbuf;
++            have_next = false;
++        } else {
++            uint32_t r_size = sizeof(req);
++            uint32_t n_dbufs = 1;
++            uint32_t flags   = 0;
++            err = dspqueue_read_noblock(queue, &flags, n_dbufs, &n_dbufs, &dbuf, r_size, &r_size, (uint8_t *) &req);
++            if (err == AEE_EWOULDBLOCK) {
++                if (--poll_count) {
++                    qurt_sleep(DSPQUEUE_POLL_TIMEOUT_USEC);
++                    continue;
++                }
++                break;
++            }
++            if (err != 0) {
++                FARF(ERROR, "dspqueue_read_noblock failed: 0x%08x", (unsigned) err);
++                break;
++            }
++            if (r_size < sizeof(req) || n_dbufs != 1) {
++                FARF(ERROR, "invalid request : size %u n-dbufs %u", r_size, n_dbufs);
+                 continue;
+             }
+-            break;
+         }
++        // Reset poll count for valid requests
++        poll_count = DSPQUEUE_POLL_COUNT;
+ 
+-        if (err != 0) {
+-            FARF(ERROR, "dspqueue_read_noblock failed: 0x%08x", (unsigned) err);
+-            break;
++        // Map this batch now (fast when the previous iteration prepared it), then look for the next one.
++        {
++            struct htp_buf_desc * bufs = (struct htp_buf_desc *) dbuf.ptr;
++            (void) prep_op_bufs(ctx, bufs, req.n_bufs, 0);
++            ctx->mmap_inuse = bufs_mmap_mask(ctx, bufs, req.n_bufs);
+         }
+ 
+-        if (r_size < sizeof(req) || n_dbufs != 1) {
+-            FARF(ERROR, "invalid request : size %u n-dbufs %u", r_size, n_dbufs);
+-            continue;
++        struct htp_prep_job job;
++        qurt_thread_t       prep_tid = 0;
++        bool                prep_running = false;
++        {
++            uint32_t r_size = sizeof(next_req);
++            uint32_t n_dbufs = 1;
++            uint32_t flags   = 0;
++            err = dspqueue_read_noblock(queue, &flags, n_dbufs, &n_dbufs, &next_dbuf, r_size, &r_size, (uint8_t *) &next_req);
++            if (err == 0 && r_size >= sizeof(next_req) && n_dbufs == 1) {
++                have_next = true;
++                struct htp_buf_desc * nbufs = (struct htp_buf_desc *) next_dbuf.ptr;
++                if (ctx->prep_stack && prep_op_bufs_fit(ctx, nbufs, next_req.n_bufs, ctx->mmap_inuse)) {
++                    job.ctx = ctx; job.bufs = nbufs; job.n_bufs = next_req.n_bufs; job.protect = ctx->mmap_inuse; job.done = 0;
++                    qurt_thread_attr_t attr;
++                    qurt_thread_attr_init(&attr);
++                    qurt_thread_attr_set_stack_addr(&attr, ctx->prep_stack);
++                    qurt_thread_attr_set_stack_size(&attr, ctx->prep_stack_size);
++                    qurt_thread_attr_set_priority(&attr, ctx->thread_prio + 20);
++                    qurt_thread_attr_set_name(&attr, "htp-prep");
++                    if (qurt_thread_create(&prep_tid, &attr, prep_thread_fn, &job) == 0) {
++                        prep_running = true;
++                    }
++                }
++            } else if (err == 0) {
++                FARF(ERROR, "invalid request : size %u n-dbufs %u", r_size, n_dbufs);
++            }
+         }
+ 
+-        // Reset poll count for valid requests
+-        poll_count = DSPQUEUE_POLL_COUNT;
+-
+         process_opbatch(ctx, &req, &dbuf);
++
++        if (prep_running) {
++            int status = 0;
++            (void) qurt_thread_join(prep_tid, &status);
++            // job.done == -1: the next batch maps itself at the top of the loop (protect == 0)
++        }
+     }
+ 
+     vtcm_release(ctx);
+diff --git a/ggml/src/ggml-hexagon/htp/matmul-ops.c b/ggml/src/ggml-hexagon/htp/matmul-ops.c
+index fb15310cf..4100b94e3 100644
+--- a/ggml/src/ggml-hexagon/htp/matmul-ops.c
++++ b/ggml/src/ggml-hexagon/htp/matmul-ops.c
+@@ -248,6 +248,175 @@ static const uint8_t __attribute__((aligned(VLEN))) kvalues_mxfp4_lut[] = {
+ #include "hvx-mm-kernels-float.h"
+ #include "hmx-mm-kernels-tiled.h"
+ 
++// ---- MoE vector-matmul streaming (x-elite-35b port, candidate B1) -------------------------------------------------
++// The stock hvx_mv_id*_tiled kernels restart their prefetch window at every (expert[, weight]) boundary and issue one
++// DMA descriptor per 32-row column tile (16 k-tiles x 576 B for q4_0 at k = 512). On the X Elite the trace showed
++// DMA depth 1.15 and 20% DMA-exposed time for ffn_down. This streams all (expert, weight, tile) units of a thread
++// through one prefetch ring and groups HTP_MVID_GROUP consecutive tiles per descriptor; the VTCM slot ring (n_prefetch
++// tile slots) and the vec_dot calls are unchanged, so the result is bit-identical.
++#define HTP_MVID_GROUP 4u
++
++struct htp_mvid_seg {
++    dma_addr_t src0_row;         // weight rows of this expert (and weight)
++    float *    dst_row;          // output row
++    uint32_t   tile_row_stride;  // DDR bytes per column tile
++    uint32_t   slot_stride;      // VTCM bytes per column tile (n_k_tiles_w * aligned_tile_size)
++    uint32_t   tile_size;
++    uint32_t   aligned_tile_size;
++    uint32_t   n_k_tiles_w;
++    uint32_t   ct_start;
++    uint32_t   ct_end;
++    uint32_t   ne0;              // dst->ne[0] (valid rows)
++    uint32_t   ne10;             // k
++};
++
++static inline uint32_t htp_mvid_seg_tiles(const struct htp_mvid_seg * sg) {
++    return sg->ct_end > sg->ct_start ? sg->ct_end - sg->ct_start : 0;
++}
++
++// unit u of segment sg = tile ct_start + u; group = up to HTP_MVID_GROUP consecutive tiles of one segment
++static void htp_mvid_stream(const htp_thread_t * th, struct htp_mm_context * mmctx, const struct htp_mvid_seg * segs,
++                            uint32_t n_seg, uint32_t n_prefetch, uint8_t * vtcm_base, uint32_t vtcm_bytes,
++                            const uint8_t * act_col, uint32_t group_req) {
++    dma_queue * dma_q = th->dma_q;
++    struct htp_thread_trace * tr = th->trace;
++
++    uint32_t slot_stride = 0;
++    for (uint32_t i = 0; i < n_seg; i++) {
++        if (segs[i].slot_stride > slot_stride) slot_stride = segs[i].slot_stride;
++    }
++    if (slot_stride == 0) return;
++
++    // ring of tile slots: n_slots tiles, grouped HTP_MVID_GROUP per descriptor
++    uint32_t n_slots = n_prefetch;
++    if ((uint64_t) n_slots * slot_stride > vtcm_bytes) n_slots = vtcm_bytes / slot_stride;
++    uint32_t group = group_req ? group_req : HTP_MVID_GROUP;
++    if (group > HTP_MM_MAX_PREFETCH) group = HTP_MM_MAX_PREFETCH;
++    if (n_slots < 2 * group) group = n_slots >= 2 ? n_slots / 2 : 1;   // keep at least two descriptors in flight
++    if (group == 0) group = 1;
++    const uint32_t n_groups_ring = n_slots / group;                     // descriptors in flight
++    if (n_groups_ring == 0) return;
++
++    // producer cursor
++    uint32_t p_seg = 0, p_ct = 0;
++    while (p_seg < n_seg && htp_mvid_seg_tiles(&segs[p_seg]) == 0) p_seg++;
++    if (p_seg < n_seg) p_ct = segs[p_seg].ct_start;
++
++    // push one group: tiles [p_ct, p_ct + gt) of segment p_seg into slot base `slot`
++    #define HTP_MVID_PUSH(slot_ptr, out_gt)                                                                          \
++        do {                                                                                                         \
++            const struct htp_mvid_seg * sg = &segs[p_seg];                                                           \
++            uint32_t gt_ = sg->ct_end - p_ct;                                                                         \
++            if (gt_ > group) gt_ = group;                                                                              \
++            dma_queue_push(dma_q, dma_make_data((slot_ptr), sg->src0_row + (dma_addr_t) p_ct * sg->tile_row_stride),  \
++                           sg->aligned_tile_size, sg->tile_size, sg->tile_size, (size_t) gt_ * sg->n_k_tiles_w);      \
++            (out_gt) = gt_;                                                                                           \
++            p_ct += gt_;                                                                                              \
++            if (p_ct >= sg->ct_end) {                                                                                \
++                p_seg++;                                                                                             \
++                while (p_seg < n_seg && htp_mvid_seg_tiles(&segs[p_seg]) == 0) p_seg++;                              \
++                if (p_seg < n_seg) p_ct = segs[p_seg].ct_start;                                                      \
++            }                                                                                                        \
++        } while (0)
++
++    // in-flight bookkeeping (ring order == pop order)
++    struct htp_mvid_inflight { uint32_t seg, ct, gt; uint8_t * slot; } inflight[HTP_MM_MAX_PREFETCH];
++    uint32_t head = 0, n_inflight = 0;
++
++    for (uint32_t g = 0; g < n_groups_ring && p_seg < n_seg; g++) {
++        uint8_t * slot = vtcm_base + (size_t) g * group * slot_stride;
++        const uint32_t seg = p_seg, ct = p_ct;
++        uint32_t gt = 0;
++        HTP_MVID_PUSH(slot, gt);
++        inflight[(head + n_inflight) % HTP_MM_MAX_PREFETCH] = (struct htp_mvid_inflight) { seg, ct, gt, slot };
++        n_inflight++;
++    }
++
++    while (n_inflight > 0) {
++        const struct htp_mvid_inflight cur = inflight[head];
++        head = (head + 1) % HTP_MM_MAX_PREFETCH;
++        n_inflight--;
++
++        (void) dma_queue_pop(dma_q);   // the group landed in cur.slot
++        const struct htp_mvid_seg * sg = &segs[cur.seg];
++        for (uint32_t t = 0; t < cur.gt; t++) {
++            const uint32_t ct = cur.ct + t;
++            const uint8_t * w_tile = cur.slot + (size_t) t * sg->slot_stride;
++            int valid_rows = (int) sg->ne0 - (int) (ct * 32);
++            valid_rows = MIN(32, MAX(0, valid_rows));
++            htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, ct);
++            mmctx->vec_dot_32x1(sg->ne10, &sg->dst_row[ct * 32], w_tile, act_col, valid_rows, NULL);
++            htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, ct);
++        }
++        if (p_seg < n_seg) {
++            const uint32_t seg = p_seg, ct = p_ct;
++            uint32_t gt = 0;
++            HTP_MVID_PUSH(cur.slot, gt);
++            inflight[(head + n_inflight) % HTP_MM_MAX_PREFETCH] = (struct htp_mvid_inflight) { seg, ct, gt, cur.slot };
++            n_inflight++;
++        }
++    }
++    #undef HTP_MVID_PUSH
++}
++
++// x-elite port B2: decode fused-NX matmul (one activation row) streams every weight's column tiles through one
++// prefetch ring (no pipeline drain between weights) with mv_group tiles per descriptor. Same vec_dot calls and
++// output addresses as hvx_mm_nx_2d_tiled, so the result is bit-identical.
++static bool hvx_mv_nx_2d_stream(const htp_thread_t * th, unsigned int nth, unsigned int ith, struct htp_mm_context * mmctx) {
++    struct htp_ops_context * octx = mmctx->octx;
++    const struct htp_mm_kernel_params * kparams = (const struct htp_mm_kernel_params *) octx->kernel_params;
++    const uint32_t n_weights = kparams->n_weights;
++    const struct htp_tensor * restrict act = octx->src[n_weights];
++    const uint32_t act_nrows = act->ne[1] * act->ne[2] * act->ne[3];
++    if (!kparams->mv_group || act_nrows != 1 || n_weights > HTP_MM_MAX_PREFETCH * 4) {
++        return false;
++    }
++    struct htp_mvid_seg segs[HTP_MM_MAX_PREFETCH * 4];
++    uint32_t n_seg = 0;
++    for (uint32_t widx = 0; widx < n_weights; widx++) {
++        const struct htp_tensor * restrict src_w = octx->src[widx];
++        const struct htp_tensor * restrict dst   = octx->dsts[widx];
++        if (!src_w || !dst) continue;
++        const uint32_t ne00 = src_w->ne[0];
++        const uint32_t ne01 = src_w->ne[1];
++        uint32_t src0_start_row = 0;
++        uint32_t src0_end_row   = ne01;
++        if (octx->ctx->mdev.count > 1) {
++            const bool can_split = htp_tensor_can_row_partition(dst, sizeof(float));
++            const struct htp_tensor_mdev_range range = htp_tensor_mdev_partition(ne01, can_split ? 32 : 0,
++                                                         octx->ctx->mdev.idx, octx->ctx->mdev.count, &octx->ctx->mdev.count_div);
++            src0_start_row = range.start;
++            src0_end_row   = range.start + range.count;
++        }
++        const uint32_t nrows = src0_end_row - src0_start_row;
++        uint32_t src0_nrows_per_hvx = fastdiv(nrows + nth - 1, &octx->n_hvx_div);
++        src0_nrows_per_hvx = hex_round_up(src0_nrows_per_hvx, 32);
++        const uint32_t start_row = src0_start_row + src0_nrows_per_hvx * ith;
++        const uint32_t end_row   = MIN(start_row + src0_nrows_per_hvx, src0_end_row);
++        if (start_row >= end_row) continue;
++
++        const uint32_t tile_size = htp_tensor_get_tile_size(src_w->type);
++        const uint32_t aligned_tile_size = htp_tensor_get_tile_padded_size(src_w->type);
++        const uint32_t n_k_tiles_w = ne00 / htp_tensor_get_tile_k(src_w->type);
++        struct htp_mvid_seg * sg = &segs[n_seg++];
++        sg->src0_row          = src_w->data;
++        sg->dst_row           = (float *) dst->data;
++        sg->tile_size         = tile_size;
++        sg->aligned_tile_size = aligned_tile_size;
++        sg->n_k_tiles_w       = n_k_tiles_w;
++        sg->tile_row_stride   = n_k_tiles_w * tile_size;
++        sg->slot_stride       = n_k_tiles_w * aligned_tile_size;
++        sg->ct_start          = start_row / 32;
++        sg->ct_end            = (end_row + 31) / 32;
++        sg->ne0               = dst->ne[0];
++        sg->ne10              = act->ne[0];
++    }
++    uint8_t * vtcm_weight_ptr = mmctx->vtcm_src0 + mmctx->vtcm_src0_size_per_hvx * ith;
++    htp_mvid_stream(th, mmctx, segs, n_seg, kparams->n_prefetch, vtcm_weight_ptr, mmctx->vtcm_src0_size_per_hvx,
++                    (const uint8_t *) mmctx->vtcm_act, kparams->mv_group);
++    return true;
++}
++
+ static void hvx_mm_2d_tiled(const htp_thread_t * th, unsigned int nth, unsigned int ith, void * data) {
+     htp_matmul_preamble;
+ 
+@@ -398,9 +567,11 @@ static void hvx_mv_2d_tiled(const htp_thread_t * th, unsigned int nth, unsigned
+                 dma_queue_pop_nowait(dma_q);
+             }
+         }
+-        for (uint32_t d = 0; d < n_prefetch && push_ct < ct_end; d++, push_ct++) {
+-            dma_queue_push(dma_q, dma_make_data(vtcm_src0_ptr + d * tile_row_transfer_size_aligned,
+-                           src0_row + push_ct * tile_row_stride), aligned_tile_size, tile_size, tile_size, n_k_tiles_w);
++        if (!kparams->mv_group) {
++            for (uint32_t d = 0; d < n_prefetch && push_ct < ct_end; d++, push_ct++) {
++                dma_queue_push(dma_q, dma_make_data(vtcm_src0_ptr + d * tile_row_transfer_size_aligned,
++                               src0_row + push_ct * tile_row_stride), aligned_tile_size, tile_size, tile_size, n_k_tiles_w);
++            }
+         }
+     }
+ 
+@@ -408,6 +579,22 @@ static void hvx_mv_2d_tiled(const htp_thread_t * th, unsigned int nth, unsigned
+         return;
+     }
+ 
++    if (kparams->mv_group) {
++        // x-elite port B2: one segment, mv_group column tiles per DMA descriptor (same vec_dot calls, same tmp rows)
++        struct htp_mvid_seg sg;
++        sg.src0_row          = src0_row;
++        sg.dst_row           = tmp - src0_start_row;   // &tmp[ct * 32 - src0_start_row] as below
++        sg.tile_size         = tile_size;
++        sg.aligned_tile_size = aligned_tile_size;
++        sg.n_k_tiles_w       = n_k_tiles_w;
++        sg.tile_row_stride   = tile_row_stride;
++        sg.slot_stride       = tile_row_transfer_size_aligned;
++        sg.ct_start          = ct_start;
++        sg.ct_end            = ct_end;
++        sg.ne0               = ne0;
++        sg.ne10              = ne10;
++        htp_mvid_stream(th, mmctx, &sg, 1, n_prefetch, vtcm_src0_ptr, mmctx->vtcm_src0_size_per_hvx, act_col, kparams->mv_group);
++    } else
+     for (uint32_t ct = ct_start; ct < ct_end; ct++) {
+         const uint8_t * w_tile = (void *) dma_queue_pop(dma_q).dst;
+ 
+@@ -459,6 +646,10 @@ static void hvx_mm_nx_2d_tiled(const htp_thread_t * th, unsigned int nth, unsign
+     const uint32_t n_prefetch = kparams->n_prefetch;
+     assert(n_prefetch >= 2 && n_prefetch <= HTP_MM_MAX_PREFETCH && (n_prefetch & (n_prefetch - 1)) == 0);
+ 
++    if (hvx_mv_nx_2d_stream(th, nth, ith, mmctx)) {
++        return;
++    }
++
+     for (uint32_t widx = 0; widx < n_weights; widx++) {
+         const struct htp_tensor * restrict src_w = octx->src[widx];
+         const struct htp_tensor * restrict dst   = octx->dsts[widx];
+@@ -1380,11 +1571,11 @@ static void hvx_mm_id_tiled(const htp_thread_t * th, unsigned int nth, unsigned
+     }
+ }
+ 
++
++
+ static void hvx_mv_id_tiled(const htp_thread_t * th, unsigned int nth, unsigned int ith, void * data) {
+     htp_matmul_preamble;
+ 
+-    const struct htp_tensor * restrict ids = octx->src[2];
+-
+     const uint32_t src0_nrows      = mmctx->src0_row_end - mmctx->src0_row_start;  // src0 rows per expert
+     const uint32_t src0_start_row  = mmctx->src0_row_start + src0_nrows_per_hvx * ith;
+     const uint32_t src0_end_row    = MIN(src0_start_row + src0_nrows_per_hvx, mmctx->src0_row_end);
+@@ -1394,67 +1585,46 @@ static void hvx_mv_id_tiled(const htp_thread_t * th, unsigned int nth, unsigned
+         return;
+     }
+ 
+-    struct htp_thread_trace * tr = th->trace;
+-
+     const struct htp_mm_kernel_params * kparams = (const struct htp_mm_kernel_params *) octx->kernel_params;
+     const uint32_t n_prefetch = kparams->n_prefetch;
+     assert(n_prefetch >= 2 && n_prefetch <= HTP_MM_MAX_PREFETCH && (n_prefetch & (n_prefetch - 1)) == 0);
+ 
+     assert(ne13 % ne03 == 0);
+ 
+-    const size_t dst_row_size  = nb1;
+-    const size_t act_row_size = htp_mm_q8_0_tiled_row_size(ne10);
+ 
+     const uint32_t n_aids = src2->ne[0];  // num activated experts
+     const uint32_t n_ids  = ne02;         // num experts
++    (void) n_ids; (void) src0_nrows;
+ 
+     // Per-thread VTCMs for all tensors
+     uint8_t * restrict vtcm_src0_ptr = mmctx->vtcm_src0 + mmctx->vtcm_src0_size_per_hvx * ith;
+     uint8_t * restrict act_data = mmctx->vtcm_act;
+ 
+-    for (uint32_t ie1 = 0; ie1 < n_aids; ++ie1) {  // for each expert
++    struct htp_mvid_seg segs[HTP_MM_MAX_PREFETCH * 4];   // n_expert_used <= 64 (nothing uses more)
++    uint32_t n_seg = 0;
++    const uint32_t tile_size = htp_tensor_get_tile_size(src0->type);
++    const uint32_t aligned_tile_size = htp_tensor_get_tile_padded_size(src0->type);
++    const uint32_t n_k_tiles_w = ne00 / htp_tensor_get_tile_k(src0->type);
++    for (uint32_t ie1 = 0; ie1 < n_aids && n_seg < HTP_MM_MAX_PREFETCH * 4; ++ie1) {  // for each expert
+         const int32_t eid = *(const int32_t *) ((const uint8_t *) src2->data + ie1 * src2->nb[0]);
+         if (eid < 0) {
+             continue;
+         }
+         assert(eid >= 0 && eid < (int32_t) n_ids);
+-
+-        const dma_addr_t src0_row = src0->data + eid * nb02;
+-        const uint8_t * restrict act_col = (const uint8_t *) act_data;
+-        float * restrict dst_row          = (float *) (dst->data + ie1 * nb1);
+-
+-        const uint32_t tile_size = htp_tensor_get_tile_size(src0->type);
+-        const uint32_t aligned_tile_size = htp_tensor_get_tile_padded_size(src0->type);
+-        const uint32_t n_k_tiles_w = ne00 / htp_tensor_get_tile_k(src0->type);
+-        const uint32_t tile_row_stride = n_k_tiles_w * tile_size;
+-        const uint32_t tile_row_transfer_size_aligned = n_k_tiles_w * aligned_tile_size;
+-
+-        const uint32_t ct_start = src0_start_row / 32;
+-        const uint32_t ct_end   = (src0_end_row + 31) / 32;
+-
+-        uint32_t push_ct = ct_start;
+-        for (uint32_t d = 0; d < n_prefetch && push_ct < ct_end; d++, push_ct++) {
+-            dma_queue_push(dma_q, dma_make_data(vtcm_src0_ptr + d * tile_row_transfer_size_aligned, src0_row + push_ct * tile_row_stride),
+-                           aligned_tile_size, tile_size, tile_size, n_k_tiles_w);
+-        }
+-
+-        for (uint32_t ct = ct_start; ct < ct_end; ct++) {
+-            const uint8_t * w_tile = (void *) dma_queue_pop(dma_q).dst;
+-
+-            int valid_rows = (int)ne0 - (int)(ct * 32);
+-            valid_rows = MIN(32, MAX(0, valid_rows));
+-
+-            htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, ct);
+-            mmctx->vec_dot_32x1(ne10, &dst_row[ct * 32], w_tile, act_col, valid_rows, NULL);
+-            htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, ct);
+-
+-            if (push_ct < ct_end) {
+-                dma_queue_push(dma_q, dma_make_data(w_tile, src0_row + push_ct * tile_row_stride),
+-                               aligned_tile_size, tile_size, tile_size, n_k_tiles_w);
+-                push_ct++;
+-            }
+-        }
+-    }
++        struct htp_mvid_seg * sg = &segs[n_seg++];
++        sg->src0_row          = src0->data + eid * nb02;
++        sg->dst_row           = (float *) (dst->data + ie1 * nb1);
++        sg->tile_size         = tile_size;
++        sg->aligned_tile_size = aligned_tile_size;
++        sg->n_k_tiles_w       = n_k_tiles_w;
++        sg->tile_row_stride   = n_k_tiles_w * tile_size;
++        sg->slot_stride       = n_k_tiles_w * aligned_tile_size;
++        sg->ct_start          = src0_start_row / 32;
++        sg->ct_end            = (src0_end_row + 31) / 32;
++        sg->ne0               = ne0;
++        sg->ne10              = ne10;
++    }
++    htp_mvid_stream(th, mmctx, segs, n_seg, n_prefetch, vtcm_src0_ptr, mmctx->vtcm_src0_size_per_hvx, (const uint8_t *) act_data, HTP_MVID_GROUP);
+ }
+ 
+ static void hvx_mv_id_nx_tiled(const htp_thread_t * th, unsigned int nth, unsigned int ith, void * data) {
+@@ -1467,27 +1637,27 @@ static void hvx_mv_id_nx_tiled(const htp_thread_t * th, unsigned int nth, unsign
+     const struct htp_tensor * restrict ids  = octx->src[n_weights + 1];
+ 
+ 
+-    struct htp_thread_trace * tr = th->trace;
+-
+     const uint32_t n_prefetch = kparams->n_prefetch;
+     assert(n_prefetch >= 2 && n_prefetch <= HTP_MM_MAX_PREFETCH && (n_prefetch & (n_prefetch - 1)) == 0);
+ 
+     const uint32_t n_aids = ids->ne[0];
+     const uint32_t n_ids  = src0->ne[2];
++    (void) n_ids;
+ 
+     uint8_t * restrict vtcm_src0_ptr = mmctx->vtcm_src0 + mmctx->vtcm_src0_size_per_hvx * ith;
+     uint8_t * restrict act_data = mmctx->vtcm_act;
+ 
+-    for (uint32_t ie1 = 0; ie1 < n_aids; ++ie1) {
++    struct htp_mvid_seg segs[HTP_MM_MAX_PREFETCH * 4];
++    uint32_t n_seg = 0;
++    for (uint32_t ie1 = 0; ie1 < n_aids && n_seg < HTP_MM_MAX_PREFETCH * 4; ++ie1) {
+         const int32_t eid = *(const int32_t *) ((const uint8_t *) ids->data + ie1 * ids->nb[0]);
+         if (eid < 0) continue;
+         assert(eid < (int32_t) n_ids);
+ 
+-        for (uint32_t p = 0; p < n_weights; ++p) {
++        for (uint32_t p = 0; p < n_weights && n_seg < HTP_MM_MAX_PREFETCH * 4; ++p) {
+             const struct htp_tensor * restrict src_w = octx->src[p];
+             const struct htp_tensor * restrict dst   = octx->dsts[p];
+             if (!src_w || !dst) continue;
+-            dma_queue * dma_q = th->dma_q;
+ 
+             const uint32_t ne01 = src_w->ne[1];
+             uint32_t start_row = 0;
+@@ -1507,43 +1677,25 @@ static void hvx_mv_id_nx_tiled(const htp_thread_t * th, unsigned int nth, unsign
+             const uint32_t src0_end_row   = MIN(src0_start_row + src0_nrows_per_hvx, end_row);
+             if (src0_start_row >= src0_end_row) continue;
+ 
+-            const dma_addr_t src0_row = src_w->data + eid * src_w->nb[2];
+-            const uint8_t * restrict act_col = (const uint8_t *) act_data;
+-            float * restrict dst_row = (float *) (dst->data + ie1 * dst->nb[1]);
+-
+             const uint32_t tile_size = htp_tensor_get_tile_size(src_w->type);
+             const uint32_t aligned_tile_size = htp_tensor_get_tile_padded_size(src_w->type);
+             const uint32_t n_k_tiles_w = src_w->ne[0] / htp_tensor_get_tile_k(src_w->type);
+-            const uint32_t tile_row_stride = n_k_tiles_w * tile_size;
+-            const uint32_t tile_row_transfer_size_aligned = n_k_tiles_w * aligned_tile_size;
+-
+-            const uint32_t ct_start = src0_start_row / 32;
+-            const uint32_t ct_end   = (src0_end_row + 31) / 32;
+-
+-            uint32_t push_ct = ct_start;
+-            for (uint32_t d = 0; d < n_prefetch && push_ct < ct_end; d++, push_ct++) {
+-                dma_queue_push(dma_q, dma_make_data(vtcm_src0_ptr + d * tile_row_transfer_size_aligned, src0_row + push_ct * tile_row_stride),
+-                               aligned_tile_size, tile_size, tile_size, n_k_tiles_w);
+-            }
+-
+-            for (uint32_t ct = ct_start; ct < ct_end; ct++) {
+-                const uint8_t * w_tile = (void *) dma_queue_pop(dma_q).dst;
+-
+-                int valid_rows = (int)dst->ne[0] - (int)(ct * 32);
+-                valid_rows = MIN(32, MAX(0, valid_rows));
+-
+-                htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, ct);
+-                mmctx->vec_dot_32x1(act->ne[0], &dst_row[ct * 32], w_tile, act_col, valid_rows, NULL);
+-                htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, ct);
+ 
+-                if (push_ct < ct_end) {
+-                    dma_queue_push(dma_q, dma_make_data(w_tile, src0_row + push_ct * tile_row_stride),
+-                                    aligned_tile_size, tile_size, tile_size, n_k_tiles_w);
+-                    push_ct++;
+-                }
+-            }
++            struct htp_mvid_seg * sg = &segs[n_seg++];
++            sg->src0_row          = src_w->data + eid * src_w->nb[2];
++            sg->dst_row           = (float *) (dst->data + ie1 * dst->nb[1]);
++            sg->tile_size         = tile_size;
++            sg->aligned_tile_size = aligned_tile_size;
++            sg->n_k_tiles_w       = n_k_tiles_w;
++            sg->tile_row_stride   = n_k_tiles_w * tile_size;
++            sg->slot_stride       = n_k_tiles_w * aligned_tile_size;
++            sg->ct_start          = src0_start_row / 32;
++            sg->ct_end            = (src0_end_row + 31) / 32;
++            sg->ne0               = dst->ne[0];
++            sg->ne10              = act->ne[0];
+         }
+     }
++    htp_mvid_stream(th, mmctx, segs, n_seg, n_prefetch, vtcm_src0_ptr, mmctx->vtcm_src0_size_per_hvx, (const uint8_t *) act_data, HTP_MVID_GROUP);
+ }
+ 
+ static void hvx_mm_id_nx_tiled(const htp_thread_t * th, unsigned int nth, unsigned int ith, void * data) {
+@@ -3435,6 +3587,84 @@ static void transfer_activation_chunk_gathered_threaded(
+     work_queue_run(ctx->hvx_queue, worker_fn, &state, actual_hvx);
+ }
+ 
++// x-elite port (M1): DMA-gather the expert's activation rows into a VTCM staging area, then convert threaded.
++typedef struct {
++    __fp16 *      dst;
++    const float * stage;
++    uint32_t      n_tasks;
++    uint32_t      n_chunks_per_task;
++    uint32_t      n_rows;
++    uint32_t      n_rows_valid;
++    uint32_t      k_block;
++    uint32_t      k_valid;
++} activation_transfer_staged_task_state_t;
++
++static void transfer_activation_chunk_staged_worker_fn(const htp_thread_t * th, unsigned int n, unsigned int i, void * data) {
++    activation_transfer_staged_task_state_t * st = data;
++    struct htp_thread_trace * tr = th->trace;
++    const uint32_t vtcm_start_row = i * st->n_chunks_per_task;
++    if (vtcm_start_row >= st->n_rows) return;
++    const uint32_t n_rows = hex_smin(st->n_rows - vtcm_start_row, st->n_chunks_per_task);
++    // The conversion pads its sub-chunk to whole 32-row tiles, so it also writes rows that belong to the next
++    // worker; like the direct gather, those rows must carry the real data (the stage holds the whole chunk), not
++    // zeros, or the two workers race and the later one wins. Valid rows are therefore counted from this worker's
++    // start to the end of the chunk's valid rows, not capped at its own sub-chunk.
++    const uint32_t n_valid = st->n_rows_valid > vtcm_start_row ? st->n_rows_valid - vtcm_start_row : 0;
++    htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_A_PREP, i);
++    transfer_activation_chunk_fp32_to_fp16_staged(st->dst, st->stage + (size_t) vtcm_start_row * st->k_block,
++                                                  vtcm_start_row, n_rows, n_valid, st->k_block, st->k_valid);
++    htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_A_PREP, i);
++}
++
++// returns false if a DMA push failed (caller falls back to the direct gather)
++static bool transfer_activation_chunk_staged_threaded(
++            struct htp_context *ctx,
++            dma_queue *dma_q,
++            __fp16 *dst,
++            float *stage,
++            const float *src,
++            int start_row,
++            int n_rows,
++            int k_block,
++            const struct mmid_row_mapping *matrix_rows,
++            int cur_a,
++            int mapping_stride,
++            int ne11,
++            size_t nb11,
++            size_t nb12,
++            int cne1,
++            int n_hvx,
++            int k_valid) {
++    if (n_rows <= 0) return true;
++    const struct fastdiv_values ne11_div = ne11 > 1 ? init_fastdiv_values(ne11) : (struct fastdiv_values){0, 0};
++    const size_t row_bytes = (size_t) k_block * sizeof(float);
++    uint32_t inflight = 0;
++    for (int r = 0; r < n_rows; ++r) {
++        const int r_idx = start_row + r;
++        if (r_idx >= cne1) break;   // padding rows beyond the expert's rows stay unwritten (converted as zeros)
++        const struct mmid_row_mapping mapping = matrix_rows[cur_a * mapping_stride + r_idx];
++        const uint32_t i11 = ne11 > 1 ? fastmodulo(mapping.i1, ne11, &ne11_div) : 0;
++        const dma_addr_t row_src = (dma_addr_t) (uintptr_t) src + (dma_addr_t) i11 * nb11 + (dma_addr_t) mapping.i2 * nb12;
++        if (!dma_queue_push(dma_q, dma_make_data(stage + (size_t) r * k_block, row_src), row_bytes, row_bytes, row_bytes, 1)) {
++            dma_queue_flush(dma_q);
++            return false;
++        }
++        if (++inflight >= 64) { dma_queue_flush(dma_q); inflight = 0; }
++    }
++    dma_queue_flush(dma_q);
++
++    int chunks_per_hvx = hex_align_up(hmx_ceil_div(n_rows, n_hvx), 2);
++    int actual_hvx = hmx_ceil_div(n_rows, chunks_per_hvx);
++    const int n_rows_valid = hex_smin(n_rows, cne1 - start_row);
++    activation_transfer_staged_task_state_t state = {
++        .dst = dst, .stage = stage, .n_tasks = actual_hvx, .n_chunks_per_task = chunks_per_hvx,
++        .n_rows = (uint32_t) n_rows, .n_rows_valid = (uint32_t) (n_rows_valid > 0 ? n_rows_valid : 0),
++        .k_block = k_block, .k_valid = k_valid,
++    };
++    work_queue_run(ctx->hvx_queue, transfer_activation_chunk_staged_worker_fn, &state, actual_hvx);
++    return true;
++}
++
+ static void transfer_output_chunk_scattered_threaded(
+             struct htp_context *ctx,
+             float *dst,
+@@ -3493,7 +3723,8 @@ static int hmx_mm_id_2d_f32(struct htp_context *ctx,
+                                          int mapping_stride,
+                                          int m_start,
+                                          int m_end,
+-                                         int n_hvx) {
++                                         int n_hvx,
++                                         int m1_mode) {   // x-elite port: 0 = staged gather (M1), 1 = stage + direct convert (diag), 2 = direct gather
+     struct htp_thread_trace * tr = &ctx->trace[0];
+     htp_trace_event_start(tr, HTP_TRACE_EVT_INIT, 0);
+ 
+@@ -3532,6 +3763,7 @@ static int hmx_mm_id_2d_f32(struct htp_context *ctx,
+                                   &size_per_n, &size_per_m, &size_per_mn);
+ 
+     const size_t overhead = htp_mm_hmx_get_2d_overhead(/*pipeline=*/false, /*is_matmul_id=*/true);
++    if (m1_mode != 2) size_per_m += (size_t) k * sizeof(float);   // x-elite port (M1): fp32 staging row for the DMA gather
+     size_t m_chunk_n_rows = 0, n_chunk_n_cols = 0;
+     if (htp_mm_hmx_compute_chunks(vtcm_budget, overhead, size_per_n, size_per_m, size_per_mn,
+                            m_core_padded, n,
+@@ -3553,6 +3785,7 @@ static int hmx_mm_id_2d_f32(struct htp_context *ctx,
+     __fp16  *vtcm_output   = (__fp16 *) vtcm_seq_alloc(&vtcm_ptr, output_area_size);
+     void    *vtcm_scratch0 = vtcm_seq_alloc(&vtcm_ptr, scratch0_size);
+     __fp16  *vtcm_scales   = (__fp16 *) vtcm_seq_alloc(&vtcm_ptr, 256);
++    float   *vtcm_stage    = (m1_mode != 2) ? (float *) vtcm_seq_alloc(&vtcm_ptr, hex_align_up(m_chunk_n_rows * (size_t) k * sizeof(float), 128)) : NULL;
+ 
+     vtcm_used = vtcm_ptr - (uint8_t *) ctx->vtcm_base;
+     if (vtcm_used > vtcm_budget) {
+@@ -3573,9 +3806,17 @@ static int hmx_mm_id_2d_f32(struct htp_context *ctx,
+         const size_t n_rows = hex_smin((size_t) m_end - mr, m_chunk_n_rows);
+         const size_t n_row_tiles = hmx_ceil_div(n_rows, HTP_MM_HMX_TILE_N_ROWS);
+ 
+-        transfer_activation_chunk_gathered_threaded(
+-            ctx, vtcm_f16_act, activation, (int) mr, (int) n_rows, k,
+-            matrix_rows, cur_a, mapping_stride, ne11, act_nb1, act_nb2, cne1, n_hvx, k_valid);
++        bool staged_ok = false;
++        if (m1_mode != 2) {
++            staged_ok = transfer_activation_chunk_staged_threaded(
++                ctx, weight_dma, vtcm_f16_act, vtcm_stage, activation, (int) mr, (int) n_rows, k,
++                matrix_rows, cur_a, mapping_stride, ne11, act_nb1, act_nb2, cne1, n_hvx, k_valid);
++        }
++        if (!staged_ok || m1_mode == 1) {
++            transfer_activation_chunk_gathered_threaded(
++                ctx, vtcm_f16_act, activation, (int) mr, (int) n_rows, k,
++                matrix_rows, cur_a, mapping_stride, ne11, act_nb1, act_nb2, cne1, n_hvx, k_valid);
++        }
+ 
+         // A0: Pre-fetch the first weight chunk (nc = 0)
+         if (n > 0) {
+@@ -3756,6 +3997,159 @@ int op_matmul(struct htp_ops_context * octx) {
+     return op_matmul_impl(octx);
+ }
+ 
++// ---- x-elite port M2: pipelined HMX MoE (one column chunk per unit, HMX of unit u-1 overlaps the HVX work of unit u) ----
++// Unit = (expert, m-chunk, weight). Per unit: [flush DMAs: staged act rows + raw weights] -> convert act (HVX) ->
++// dequant weights (HVX) -> push DMAs for the next unit -> pop HMX(u-1) + scatter(u-1) (HVX) -> push HMX(u).
++// Double-buffered fp16 weights / act / output / stage; single raw weight buffer (refilled after its dequant).
++// Same conversions, same HMX job and same scatter as hmx_mm_id_2d_f32, so the results are identical.
++struct hmx_mmid_pipe_weight {
++    float *    dst;
++    dma_addr_t weight;       // expert 0 base
++    size_t     weight_nb2;   // bytes per expert
++    size_t     dst_nb1, dst_nb2;
++    int        weight_stride, weight_type;
++};
++
++static int hmx_mm_id_pipelined(struct htp_context * ctx, dma_queue * dma_q,
++                               const struct hmx_mmid_pipe_weight * ws, uint32_t n_weights,
++                               const float * activation, int k, int n, int ne11, size_t act_nb1, size_t act_nb2,
++                               const struct mmid_row_mapping * matrix_rows, const uint32_t * matrix_row_counts,
++                               int n_as, int mapping_stride, int tile_size, int aligned_tile_size, int n_hvx) {
++    if (k % 32 != 0 || n % 32 != 0 || tile_size <= 0 || n_weights == 0) return -2;
++    if (!hex_is_aligned(activation, VLEN)) return -2;
++    const int weight_type = ws[0].weight_type;
++    for (uint32_t p = 1; p < n_weights; ++p) {
++        if (ws[p].weight_type != weight_type || ws[p].weight_stride != ws[0].weight_stride) return -2;
++    }
++    tiled_dequant_task_fn_t dequant_fn = hmx_get_dequant_worker_fn(weight_type, true);
++    if (!dequant_fn) return -2;
++    const size_t row_stride = htp_tensor_get_row_size(weight_type, k);
++    if (row_stride == 0) return -2;
++    const int n_k_tiles = k / HTP_MM_HMX_TILE_N_COLS;
++    const uint32_t n_weight_tiles = k / htp_tensor_get_tile_k(weight_type);
++    const struct fastdiv_values n_k_tiles_div = init_fastdiv_values(n_k_tiles);
++    const size_t n_col_tiles = (size_t) n / 32;
++
++    // VTCM: raw + 2 x fp16 weights + 2 x (act + out + stage) rows + scales
++    const size_t raw_size = hex_align_up(n_col_tiles * (size_t) n_weight_tiles * (size_t) aligned_tile_size, HTP_MM_HMX_TILE_SIZE);
++    const size_t w16_size = hex_align_up((size_t) n * k * sizeof(__fp16), HTP_MM_HMX_TILE_SIZE);
++    const size_t fixed    = raw_size + 2 * w16_size + 512;
++    if (fixed >= ctx->vtcm_size) return -2;
++    const size_t per_row  = 2 * ((size_t) k * sizeof(__fp16) + (size_t) n * sizeof(__fp16) + (size_t) k * sizeof(float));
++    size_t m_chunk = (ctx->vtcm_size - fixed) / per_row;
++    m_chunk = hex_align_down(m_chunk, 32);
++    if (m_chunk > 128) m_chunk = 128;
++    if (m_chunk < 32) return -2;
++    const size_t act_size   = hex_align_up(m_chunk * (size_t) k * sizeof(__fp16), HTP_MM_HMX_TILE_SIZE);
++    const size_t out_size   = hex_align_up(m_chunk * (size_t) n * sizeof(__fp16), HTP_MM_HMX_TILE_SIZE);
++    const size_t stage_size = hex_align_up(m_chunk * (size_t) k * sizeof(float), 128);
++
++    uint8_t * vp = (uint8_t *) ctx->vtcm_base;
++    uint8_t * raw      = (uint8_t *) vtcm_seq_alloc(&vp, raw_size);
++    __fp16 *  w16[2]   = { (__fp16 *) vtcm_seq_alloc(&vp, w16_size), (__fp16 *) vtcm_seq_alloc(&vp, w16_size) };
++    __fp16 *  act16[2] = { (__fp16 *) vtcm_seq_alloc(&vp, act_size), (__fp16 *) vtcm_seq_alloc(&vp, act_size) };
++    __fp16 *  out16[2] = { (__fp16 *) vtcm_seq_alloc(&vp, out_size), (__fp16 *) vtcm_seq_alloc(&vp, out_size) };
++    float *   stage[2] = { (float *) vtcm_seq_alloc(&vp, stage_size), (float *) vtcm_seq_alloc(&vp, stage_size) };
++    __fp16 *  scales   = (__fp16 *) vtcm_seq_alloc(&vp, 256);
++    if ((size_t) (vp - (uint8_t *) ctx->vtcm_base) > ctx->vtcm_size) return -2;
++    hmx_init_column_scales(scales, Q6_V_vsplat_R(0x3c00));
++
++    const struct fastdiv_values ne11_div = ne11 > 1 ? init_fastdiv_values(ne11) : (struct fastdiv_values){0, 0};
++    const size_t act_row_bytes = (size_t) k * sizeof(float);
++    const uint32_t raw_height  = (uint32_t) (n_col_tiles * n_weight_tiles);
++
++    // unit cursor
++    struct unit { int a; int mr; int n_rows; int n_valid; uint32_t p; };
++    #define PIPE_NEXT_UNIT(u)                                                                   \
++        do {                                                                                    \
++            for (;;) {                                                                          \
++                if ((u).a >= n_as) break;                                                       \
++                const int cne1_ = (int) matrix_row_counts[(u).a];                               \
++                const int mpad_ = hex_align_up(cne1_, 32);                                       \
++                if (cne1_ == 0 || (u).mr >= mpad_) { (u).a++; (u).mr = 0; (u).p = 0; continue; } \
++                (u).n_rows  = hex_smin(mpad_ - (u).mr, (int) m_chunk);                          \
++                (u).n_valid = hex_smin(cne1_ - (u).mr, (u).n_rows);                             \
++                if ((u).n_valid < 0) (u).n_valid = 0;                                           \
++                break;                                                                          \
++            }                                                                                   \
++        } while (0)
++    #define PIPE_ADVANCE(u)                                                                     \
++        do { if (++(u).p >= n_weights) { (u).p = 0; (u).mr += (int) m_chunk; } PIPE_NEXT_UNIT(u); } while (0)
++
++    // push the DMAs of unit u into parity par: staged act rows (only for p == 0 of the m-chunk, the act is shared
++    // by the weights of the same chunk) and the raw weights
++    #define PIPE_PUSH(u, par)                                                                                        \
++        do {                                                                                                         \
++            if ((u).p == 0) {                                                                                        \
++                for (int r_ = 0; r_ < (u).n_valid; ++r_) {                                                           \
++                    const struct mmid_row_mapping mp_ = matrix_rows[(u).a * mapping_stride + (u).mr + r_];          \
++                    const uint32_t i11_ = ne11 > 1 ? fastmodulo(mp_.i1, ne11, &ne11_div) : 0;                        \
++                    const dma_addr_t src_ = (dma_addr_t) (uintptr_t) activation + (dma_addr_t) i11_ * act_nb1 +      \
++                                            (dma_addr_t) mp_.i2 * act_nb2;                                          \
++                    if (!dma_queue_push(dma_q, dma_make_data(stage[par] + (size_t) r_ * k, src_),                    \
++                                        act_row_bytes, act_row_bytes, act_row_bytes, 1)) return -1;                 \
++                }                                                                                                    \
++            }                                                                                                        \
++            if (!dma_queue_push(dma_q, dma_make_data(raw, ws[(u).p].weight + (dma_addr_t) (u).a * ws[(u).p].weight_nb2), \
++                                aligned_tile_size, tile_size, tile_size, raw_height)) return -1;                     \
++        } while (0)
++
++    struct unit cur = { 0, 0, 0, 0, 0 };
++    PIPE_NEXT_UNIT(cur);
++    if (cur.a >= n_as) return 0;
++    PIPE_PUSH(cur, 0);
++
++    hmx_matmul_job_t jobs[2];
++    struct unit prev = cur; bool have_prev = false;
++    for (uint32_t u = 0; cur.a < n_as; ++u) {
++        const uint32_t par = u & 1;
++        dma_queue_flush(dma_q);   // stage rows (if any) + raw weights of this unit
++        {
++            // the m-chunk's rows were staged when its first weight (p == 0) was unit u - p, parity (u - p) & 1;
++            // every weight of the chunk converts them again into its own act16[par] (cheap: VTCM -> VTCM)
++            int chunks_per_hvx = hex_align_up(hmx_ceil_div(cur.n_rows, n_hvx), 2);
++            int actual_hvx = hmx_ceil_div(cur.n_rows, chunks_per_hvx);
++            activation_transfer_staged_task_state_t st = {
++                .dst = act16[par], .stage = stage[(u - cur.p) & 1], .n_tasks = actual_hvx,
++                .n_chunks_per_task = chunks_per_hvx, .n_rows = (uint32_t) cur.n_rows, .n_rows_valid = (uint32_t) cur.n_valid,
++                .k_block = (uint32_t) k, .k_valid = (uint32_t) k,
++            };
++            work_queue_run(ctx->hvx_queue, transfer_activation_chunk_staged_worker_fn, &st, actual_hvx);
++        }
++        dequantize_tiled_weight_chunk_to_fp16_tiles(ctx, w16[par], raw, n, k, row_stride, weight_type,
++                                                    n_k_tiles, n_k_tiles_div, dequant_fn, n_hvx);
++        // next unit's DMAs (raw is free again; its stage rows go to the other parity only when a new m-chunk starts)
++        struct unit nxt = cur; PIPE_ADVANCE(nxt);
++        if (nxt.a < n_as) {
++            // a new m-chunk (p == 0) stages into parity (u + 1) & 1: that stage buffer was last used by the chunk
++            // started at unit u - 1 (p == 0 there), whose conversions are all done by now when n_weights <= 2
++            PIPE_PUSH(nxt, (u + 1) & 1);
++        }
++        if (have_prev) {
++            hmx_queue_pop(ctx->hmx_queue);
++            transfer_output_chunk_scattered_threaded(ctx, ws[prev.p].dst, out16[par ^ 1], prev.mr, prev.n_rows, n,
++                                                     matrix_rows, prev.a, mapping_stride, ws[prev.p].dst_nb1, ws[prev.p].dst_nb2,
++                                                     (int) matrix_row_counts[prev.a], n_hvx);
++        }
++        hmx_matmul_job_init(&jobs[par], out16[par], act16[par], w16[par], scales,
++                            hmx_ceil_div(cur.n_rows, HTP_MM_HMX_TILE_N_ROWS), (uint32_t) n_col_tiles, k / HTP_MM_HMX_TILE_N_ROWS);
++        hmx_queue_push(ctx->hmx_queue, hmx_queue_make_desc(hmx_matmul_worker_fn, &jobs[par]));
++        prev = cur; have_prev = true;
++        cur = nxt;
++        if (cur.a >= n_as) {
++            hmx_queue_pop(ctx->hmx_queue);
++            transfer_output_chunk_scattered_threaded(ctx, ws[prev.p].dst, out16[par], prev.mr, prev.n_rows, n,
++                                                     matrix_rows, prev.a, mapping_stride, ws[prev.p].dst_nb1, ws[prev.p].dst_nb2,
++                                                     (int) matrix_row_counts[prev.a], n_hvx);
++            break;
++        }
++    }
++    #undef PIPE_NEXT_UNIT
++    #undef PIPE_ADVANCE
++    #undef PIPE_PUSH
++    return 0;
++}
++
+ static int hmx_mm_op_matmul_id(
+     struct htp_ops_context * octx,
+     struct htp_mm_context * mmctx
+@@ -3767,6 +4161,16 @@ static int hmx_mm_op_matmul_id(
+     const int n_ids = octx->src[2]->ne[0];
+     const int n_as  = ne02;
+ 
++    const int m1_mode = kparams->mv_group;   // x-elite port: GGML_HEXAGON_MV_GROUP selects the MoE prefill variant
++    if (m1_mode == 3 && octx->ctx->mdev.count == 1 && kparams->tile_size > 0) {   // x-elite port M2
++        const struct hmx_mmid_pipe_weight w0 = { (float *) dst->data, src0->data, nb02, nb1, nb2, (int) src0->nb[1], (int) src0->type };
++        const int ret = hmx_mm_id_pipelined(octx->ctx, octx->ctx->dma[0], &w0, 1, (const float *) act->data, (int) ne00, (int) ne01,
++                                            (int) ne11, nb11, nb12, matrix_rows, matrix_row_counts, n_as, mmctx->mapping_stride,
++                                            kparams->tile_size, kparams->aligned_tile_size, (int) octx->n_hvx);
++        if (ret == 0) return HTP_STATUS_OK;
++        if (ret != -2) { FARF(ERROR, "HMX matmul ID pipelined failed: %d\n", ret); return HTP_STATUS_NO_SUPPORT; }
++    }
++
+     const bool mdev_split = (octx->ctx->mdev.count > 1) && htp_tensor_can_row_partition(dst, sizeof(float));
+     if (octx->ctx->mdev.count > 1 && !mdev_split && octx->ctx->mdev.idx > 0) {
+         return HTP_STATUS_OK;
+@@ -3810,7 +4214,7 @@ static int hmx_mm_op_matmul_id(
+                                    (int) src0->nb[1], (int) src0->type,
+                                    kparams->tile_size, kparams->aligned_tile_size,
+                                    matrix_rows, cur_a, mmctx->mapping_stride,
+-                                   m_start, m_end, (int) octx->n_hvx);
++                                   m_start, m_end, (int) octx->n_hvx, m1_mode == 3 ? 0 : m1_mode);
+         if (ret != 0) {
+             FARF(ERROR, "HMX matmul failed for expert %u, error %d\n", cur_a, ret);
+             return HTP_STATUS_NO_SUPPORT;
+@@ -3922,6 +4326,25 @@ static int hmx_mm_op_matmul_id_nx(
+     const struct htp_tensor * restrict act  = octx->src[n_weights];
+     const int n_as = src0->ne[2];
+ 
++    const int m1_mode = kparams->mv_group;
++    if (m1_mode == 3 && octx->ctx->mdev.count == 1 && kparams->tile_size > 0 && n_weights <= 4) {   // x-elite port M2
++        struct hmx_mmid_pipe_weight ws[4]; uint32_t nw = 0; bool same = true;
++        for (uint32_t p = 0; p < n_weights; ++p) {
++            const struct htp_tensor * restrict src_w = octx->src[p];
++            const struct htp_tensor * restrict dst   = octx->dsts[p];
++            if (!src_w || !dst) continue;
++            if (src_w->ne[0] != src0->ne[0] || src_w->ne[1] != src0->ne[1]) same = false;
++            ws[nw++] = (struct hmx_mmid_pipe_weight) { (float *) dst->data, src_w->data, src_w->nb[2], dst->nb[1], dst->nb[2], (int) src_w->nb[1], (int) src_w->type };
++        }
++        if (same && nw > 0) {
++            const int ret = hmx_mm_id_pipelined(octx->ctx, octx->ctx->dma[0], ws, nw, (const float *) act->data, (int) src0->ne[0], (int) src0->ne[1],
++                                                (int) act->ne[1], act->nb[1], act->nb[2], matrix_rows, matrix_row_counts, n_as, mmctx->mapping_stride,
++                                                kparams->tile_size, kparams->aligned_tile_size, (int) octx->n_hvx);
++            if (ret == 0) return HTP_STATUS_OK;
++            if (ret != -2) { FARF(ERROR, "HMX matmul ID NX pipelined failed: %d\n", ret); return HTP_STATUS_NO_SUPPORT; }
++        }
++    }
++
+     bool mdev_split = (octx->ctx->mdev.count > 1);
+     for (uint32_t p = 0; p < n_weights && mdev_split; ++p) {
+         const struct htp_tensor * restrict dst = octx->dsts[p];
+@@ -3974,7 +4397,7 @@ static int hmx_mm_op_matmul_id_nx(
+                                        (int) src_w->nb[1], (int) src_w->type,
+                                        kparams->tile_size, kparams->aligned_tile_size,
+                                        matrix_rows, cur_a, mmctx->mapping_stride,
+-                                       m_start, m_end, (int) octx->n_hvx);
++                                       m_start, m_end, (int) octx->n_hvx, m1_mode == 3 ? 0 : m1_mode);
+             if (ret != 0) {
+                 FARF(ERROR, "HMX matmul ID NX failed for expert %u weight %u, error %d\n", cur_a, p, ret);
+                 return HTP_STATUS_NO_SUPPORT;
+diff --git a/ggml/src/ggml-hexagon/htp/matmul-ops.h b/ggml/src/ggml-hexagon/htp/matmul-ops.h
+index 0c16fe7b8..ecac89285 100644
+--- a/ggml/src/ggml-hexagon/htp/matmul-ops.h
++++ b/ggml/src/ggml-hexagon/htp/matmul-ops.h
+@@ -61,7 +61,7 @@ enum htp_mm_kernel_type {
+ struct htp_mm_kernel_params {
+     uint8_t  kernel_type;        // enum htp_mm_kernel_type
+     uint8_t  pipeline;           // 1 = pipelined execution, 0 = standard
+-    uint8_t  unused;             // reserved
++    uint8_t  mv_group;           // decode mv / fused-NX: column tiles per DMA descriptor through one prefetch ring (0 = stock per-tile ring)
+     uint8_t  n_hmx;              // 1 = use HMX, 0 = use HVX
+ 
+     uint8_t  n_hvx;              // Number of threads to spawn
+diff --git a/ggml/src/ggml-hexagon/htp/qedge_prefill4/LICENSE.llama.cpp b/ggml/src/ggml-hexagon/htp/qedge_prefill4/LICENSE.llama.cpp
+new file mode 100644
+index 000000000..e7dca554b
+--- /dev/null
++++ b/ggml/src/ggml-hexagon/htp/qedge_prefill4/LICENSE.llama.cpp
+@@ -0,0 +1,21 @@
++MIT License
++
++Copyright (c) 2023-2026 The ggml authors
++
++Permission is hereby granted, free of charge, to any person obtaining a copy
++of this software and associated documentation files (the "Software"), to deal
++in the Software without restriction, including without limitation the rights
++to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++copies of the Software, and to permit persons to whom the Software is
++furnished to do so, subject to the following conditions:
++
++The above copyright notice and this permission notice shall be included in all
++copies or substantial portions of the Software.
++
++THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++SOFTWARE.
+diff --git a/ggml/src/ggml-hexagon/htp/qedge_prefill4/candidate.c b/ggml/src/ggml-hexagon/htp/qedge_prefill4/candidate.c
+new file mode 100644
+index 000000000..fdb8b3f22
+--- /dev/null
++++ b/ggml/src/ggml-hexagon/htp/qedge_prefill4/candidate.c
+@@ -0,0 +1,106 @@
++/* SPDX-License-Identifier: MIT
++ * Qf32 convolution and four-tap weight deinterleave adapted from llama.cpp,
++ * commit 94256114c229674ef96e76eb2dea596e65b43818, ggml-hexagon/htp/ssm-conv.c.
++ * See LICENSE.llama.cpp. Token-major carry follows the verified direct prototype.
++ */
++#include "kernel.h"
++#include <hexagon_types.h>
++#include <hexagon_protos.h>
++#include <hvx_hexagon_protos.h>
++
++void prefill4_hvx(const float *restrict x, const float *restrict old,
++                 const float *restrict weight, float *restrict y, float *restrict next,
++                 unsigned tokens, unsigned channels, unsigned tree_order) {
++    union { HVX_Vector vec[3]; float f[3][32]; } history[KDA_MAX_C/32];
++    HVX_Vector wt[KDA_MAX_C/32][4];
++    kda_phase_begin(KDA_PREP);
++    for (unsigned c = 0; c < channels; c += 32) {
++        const unsigned block = c / 32;
++        const HVX_Vector *w = (const HVX_Vector *)(weight + 4*c);
++        HVX_VectorPair p01 = Q6_W_vdeal_VVR(w[1], w[0], -4);
++        HVX_VectorPair p23 = Q6_W_vdeal_VVR(w[3], w[2], -4);
++        HVX_VectorPair p02 = Q6_W_vdeal_VVR(Q6_V_lo_W(p23), Q6_V_lo_W(p01), -4);
++        HVX_VectorPair p13 = Q6_W_vdeal_VVR(Q6_V_hi_W(p23), Q6_V_hi_W(p01), -4);
++        wt[block][0] = Q6_V_lo_W(p02);
++        wt[block][1] = Q6_V_lo_W(p13);
++        wt[block][2] = Q6_V_hi_W(p02);
++        wt[block][3] = Q6_V_hi_W(p13);
++        for (unsigned j = 0; j < 32; ++j) {
++            history[block].f[0][j] = old[3*(c+j)];
++            history[block].f[1][j] = old[3*(c+j)+1];
++            history[block].f[2][j] = old[3*(c+j)+2];
++        }
++    }
++    kda_phase_end(KDA_PREP);
++    kda_phase_begin(KDA_CONV);
++    for (unsigned c = 0; c < channels; c += 32) {
++        const unsigned block = c / 32;
++        HVX_Vector h0 = history[block].vec[0], h1 = history[block].vec[1], h2 = history[block].vec[2];
++        const HVX_Vector w0 = wt[block][0], w1 = wt[block][1], w2 = wt[block][2], w3 = wt[block][3];
++        #pragma clang loop unroll_count(4)
++        for (unsigned t = 0; t < tokens; ++t) {
++            HVX_Vector x3 = *(const HVX_Vector *)(x + t*channels + c);
++            HVX_Vector sum;
++            if (tree_order) {
++                // stock d_conv == 4 decode kernel (ssm-conv.c): (h0w0 + h1w1) + (h2w2 + x3w3)
++                HVX_Vector a = Q6_Vqf32_vadd_Vqf32Vqf32(Q6_Vqf32_vmpy_VsfVsf(h0, w0), Q6_Vqf32_vmpy_VsfVsf(h1, w1));
++                HVX_Vector b = Q6_Vqf32_vadd_Vqf32Vqf32(Q6_Vqf32_vmpy_VsfVsf(h2, w2), Q6_Vqf32_vmpy_VsfVsf(x3, w3));
++                sum = Q6_Vqf32_vadd_Vqf32Vqf32(a, b);
++            } else {
++                // stock prefill kernel: acc = 0; acc += x_j * w_j for j = 0..3
++                sum = Q6_V_vzero();   // same bits as the stock zero start (sf 0.0)
++                sum = Q6_Vqf32_vadd_Vqf32Vqf32(sum, Q6_Vqf32_vmpy_VsfVsf(h0, w0));
++                sum = Q6_Vqf32_vadd_Vqf32Vqf32(sum, Q6_Vqf32_vmpy_VsfVsf(h1, w1));
++                sum = Q6_Vqf32_vadd_Vqf32Vqf32(sum, Q6_Vqf32_vmpy_VsfVsf(h2, w2));
++                sum = Q6_Vqf32_vadd_Vqf32Vqf32(sum, Q6_Vqf32_vmpy_VsfVsf(x3, w3));
++            }
++            *(HVX_Vector *)(y + t*channels + c) = Q6_Vsf_equals_Vqf32(sum);
++            h0 = h1; h1 = h2; h2 = x3;
++        }
++    }
++    kda_phase_end(KDA_CONV);
++    kda_phase_begin(KDA_STATE);
++    for (unsigned c = 0; c < channels; c += 32) {
++        const unsigned block = c / 32;
++        const float *last = x + (tokens-1)*channels + c;
++        HVX_Vector r2 = *(const HVX_Vector *)last;
++        HVX_Vector r1 = tokens >= 2 ? *(const HVX_Vector *)(last - channels)
++                                    : history[block].vec[2];
++        HVX_Vector r0 = tokens >= 3 ? *(const HVX_Vector *)(last - 2*channels)
++                                    : history[block].vec[tokens];
++
++        // Form eight (r0, r1, r2, pad) quads in each vector.
++        HVX_VectorPair ab = Q6_W_vshuff_VVR(r1, r0, -4);
++        HVX_VectorPair cc = Q6_W_vshuff_VVR(r2, r2, -4);
++        HVX_VectorPair lo = Q6_W_vshuff_VVR(Q6_V_lo_W(cc), Q6_V_lo_W(ab), -8);
++        HVX_VectorPair hi = Q6_W_vshuff_VVR(Q6_V_hi_W(cc), Q6_V_hi_W(ab), -8);
++        HVX_Vector q0 = Q6_V_lo_W(lo), q1 = Q6_V_hi_W(lo);
++        HVX_Vector q2 = Q6_V_lo_W(hi), q3 = Q6_V_hi_W(hi);
++
++        // Reverse delta compacts the 24 live words into the low 96 bytes.
++        // Tracing output word i backwards through strides 16,8,4,2,1
++        // routes it to input word i+i/3. Each byte of a word follows that route.
++        static const HVX_Vector compact = {
++            0x00000000, 0x00000000, 0x00000000, 0x10101010,
++            0x04040404, 0x0c0c0c0c, 0x20202020, 0x2c2c2c2c,
++            0x08080808, 0x10101010, 0x18181818, 0x18181818,
++            0x44444444, 0x44444444, 0x58585858, 0x54545454,
++            0x10101010, 0x10101010, 0x20202020, 0x20202020,
++            0x34343434, 0x3c3c3c3c, 0x30303030, 0x2c2c2c2c,
++            0x08080808, 0x00000000, 0x08080808, 0x08080808,
++            0x34343434, 0x24242424, 0x28282828, 0x24242424
++        };
++        HVX_Vector a = Q6_V_vrdelta_VV(q0, compact);
++        HVX_Vector b = Q6_V_vrdelta_VV(q1, compact);
++        HVX_Vector c2 = Q6_V_vrdelta_VV(q2, compact);
++        HVX_Vector d = Q6_V_vrdelta_VV(q3, compact);
++
++        // Put the low 96 bytes of the left chunk at the high end, then
++        // splice 96+32, 64+64 and 32+96 bytes into three aligned stores.
++        HVX_Vector *dst = (HVX_Vector *)(next + 3*c);
++        dst[0] = Q6_V_valign_VVR(b, Q6_V_vror_VR(a, 96), 32);
++        dst[1] = Q6_V_valign_VVR(c2, Q6_V_vror_VR(b, 96), 64);
++        dst[2] = Q6_V_valign_VVR(d, Q6_V_vror_VR(c2, 96), 96);
++    }
++    kda_phase_end(KDA_STATE);
++}
+diff --git a/ggml/src/ggml-hexagon/htp/qedge_prefill4/kernel.h b/ggml/src/ggml-hexagon/htp/qedge_prefill4/kernel.h
+new file mode 100644
+index 000000000..e23421e56
+--- /dev/null
++++ b/ggml/src/ggml-hexagon/htp/qedge_prefill4/kernel.h
+@@ -0,0 +1,27 @@
++#ifndef HEXAGON_PREFILL4_H
++#define HEXAGON_PREFILL4_H
++
++#include <stdint.h>
++
++// One prepared token-major tile (row stride = channels); all buffers are disjoint
++// and 128B aligned. 1 <= tokens <= 1024; channels is 32, 64, 96 or 128.
++// old and next are [channel][3]; weight is [channel][4]; x and y are
++// [token][channel]. Order taps old0, old1, old2, x0 at the first token.
++enum { KDA_MAX_T = 1024, KDA_MAX_C = 128, KDA_STAGES = 3 };
++enum { KDA_PREP, KDA_CONV, KDA_STATE };
++
++void prefill4_hvx(const float *restrict x, const float *restrict old,
++                 const float *restrict weight, float *restrict y, float *restrict next,
++                 unsigned tokens, unsigned channels, unsigned tree_order);
++
++// Phase cycles use separate unscored binaries. The latency score measures the
++// full call with these hooks compiled out; phases are contiguous, once each.
++#ifdef KDA_PHASE_PROFILE
++void kda_phase_begin(unsigned);
++void kda_phase_end(unsigned);
++#else
++#define kda_phase_begin(i) ((void)(i))
++#define kda_phase_end(i) ((void)(i))
++#endif
++
++#endif
+diff --git a/ggml/src/ggml-hexagon/htp/ssm-conv.c b/ggml/src/ggml-hexagon/htp/ssm-conv.c
+index d75304fef..55c838eaa 100644
+--- a/ggml/src/ggml-hexagon/htp/ssm-conv.c
++++ b/ggml/src/ggml-hexagon/htp/ssm-conv.c
+@@ -20,6 +20,8 @@
+ #include "htp-tensor.h"
+ #include "hvx-utils.h"
+ #include "ssm-conv.h"
++#include "hvx-arith.h"
++#include "hvx-sigmoid.h"
+ 
+ struct htp_ssm_conv_context {
+     struct htp_ops_context *                  octx;
+@@ -634,7 +636,296 @@ int op_ssm_conv_f32(struct htp_ops_context * octx) {
+     return HTP_STATUS_OK;
+ }
+ 
++// ---- SSM_CONV_DIRECT: one-token conv straight from the recurrent-cache state, state write-back and optional SiLU ----
++#include "qedge_prefill4/candidate.c"
++
++struct ssm_direct_task {
++    struct htp_ops_context * octx;
++    uint32_t channels;
++    uint32_t tokens;
++    uint32_t silu;
++    uint32_t per_thread_bytes;
++    bool     failed[HTP_OP_MAX_NTHREADS];
++};
++
++static bool ssm_direct_tensor_ok(const struct htp_context * ctx, const struct htp_tensor * t, uint32_t cols, uint32_t rows) {
++    const uint64_t bytes = (uint64_t) cols * rows * sizeof(float);
++    if (!t || t->type != HTP_TYPE_F32 || (t->flags & (HTP_TENSOR_TILED | HTP_TENSOR_FENCE)) ||
++        t->ne[0] != cols || t->ne[1] != rows || t->ne[2] != 1 || t->ne[3] != 1 ||
++        !htp_tensor_is_contiguous(t, sizeof(float)) || t->size != bytes ||
++        !t->data || (t->data & 127u) || t->data > UINT32_MAX - bytes) {
++        return false;
++    }
++    for (uint32_t i = 0; i < HTP_MAX_MMAPS; ++i) {
++        const struct htp_mmap * m = &ctx->mmap[i];
++        if (!(m->flags & HTP_BUF_EXTENDED) && m->size >= bytes &&
++            t->data >= m->base && t->data - m->base <= m->size - bytes) {
++            return true;
++        }
++    }
++    return false;
++}
++
++static void ssm_direct_worker(const htp_thread_t * th, unsigned int nth, unsigned int ith, void * data) {
++    struct ssm_direct_task * task = data;
++    struct htp_ops_context * octx = task->octx;
++    const uint32_t tokens = task->tokens;
++    const uint32_t tile   = HTP_SSM_DIRECT_SLICE;
++    const uint32_t row    = tile * sizeof(float);
++    float * x      = (float *) (octx->ctx->vtcm_base + (size_t) ith * task->per_thread_bytes);
++    float * y      = x + tokens * tile;
++    float * old    = y + tokens * tile;
++    float * weight = old + 3 * tile;
++    float * next   = weight + 4 * tile;
++    dma_queue * q = th->dma_q;
++    struct htp_thread_trace * tr = th->trace;
++
++    for (uint32_t c = ith * tile; c < task->channels; c += nth * tile) {
++        const uint32_t off = c * sizeof(float);
++        if (!dma_queue_push(q, dma_make_data(old, octx->src[1]->data + 3 * off), 3 * row, 3 * row, 3 * row, 1) ||
++            !dma_queue_push(q, dma_make_data(weight, octx->src[2]->data + 4 * off), 4 * row, 4 * row, 4 * row, 1) ||
++            !dma_queue_push(q, dma_make_data(x, octx->src[0]->data + off), row, octx->src[0]->nb[1], row, tokens)) {
++            goto dma_failed;
++        }
++        dma_queue_flush(q);
++        htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) c);
++        prefill4_hvx(x, old, weight, y, next, tokens, tile, 1 /* tree order: both stock paths that run for d_conv == 4 (T == 1 verified, T > 1 the prefill fast path) */);
++        if (task->silu) {
++            // same primitive as the stock fused SSM_CONV+SILU kernel (hvx_ssm_conv_silu_vtcm), so y is bit-identical
++            HVX_Vector * restrict vy = (HVX_Vector *) y;
++            for (uint32_t i = 0; i < (tokens * tile) / 32; ++i) {
++                vy[i] = hvx_vec_silu_f32(vy[i]);
++            }
++        }
++        htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) c);
++        if (!dma_queue_push(q, dma_make_data(octx->dsts[1]->data + off, y), octx->dsts[1]->nb[1], row, row, tokens) ||
++            !dma_queue_push(q, dma_make_data(octx->dsts[0]->data + 3 * off, next), 3 * row, 3 * row, 3 * row, 1)) {
++            goto dma_failed;
++        }
++        dma_queue_flush(q);
++    }
++    return;
++dma_failed:
++    dma_queue_flush(q);
++    task->failed[ith] = true;
++}
++
++
++// ---- SSM_CONV_DIRECT prefill (T > 1): chunked, wide-row DMAs, 4-tap FIR over VTCM rows (x-elite port P2) ----
++// Same arithmetic as prefill4_hvx (tree order (h0w0 + h1w1) + (h2w2 + x3w3) in qf32), so y and the state are
++// bit-identical; only the data movement changes: the thread's whole channel range is one DMA row.
++static inline void ssm_direct_prep_weights(const float * restrict wraw, HVX_Vector * restrict wt, uint32_t cth) {
++    for (uint32_t c = 0; c < cth; c += 32) {
++        const HVX_Vector * w = (const HVX_Vector *) (wraw + 4 * c);
++        HVX_VectorPair p01 = Q6_W_vdeal_VVR(w[1], w[0], -4);
++        HVX_VectorPair p23 = Q6_W_vdeal_VVR(w[3], w[2], -4);
++        HVX_VectorPair p02 = Q6_W_vdeal_VVR(Q6_V_lo_W(p23), Q6_V_lo_W(p01), -4);
++        HVX_VectorPair p13 = Q6_W_vdeal_VVR(Q6_V_hi_W(p23), Q6_V_hi_W(p01), -4);
++        HVX_Vector * o = wt + (c / 32) * 4;
++        o[0] = Q6_V_lo_W(p02);
++        o[1] = Q6_V_lo_W(p13);
++        o[2] = Q6_V_hi_W(p02);
++        o[3] = Q6_V_hi_W(p13);
++    }
++}
++
++// old[3c + k] (channel-major) -> three history rows [k][c]
++static inline void ssm_direct_prep_history(const float * restrict old, float * restrict rows, uint32_t cth) {
++    for (uint32_t c = 0; c < cth; ++c) {
++        rows[c]           = old[3 * c];
++        rows[cth + c]     = old[3 * c + 1];
++        rows[2 * cth + c] = old[3 * c + 2];
++    }
++}
++
++// y[t] = (x[t-3] w0 + x[t-2] w1) + (x[t-1] w2 + x[t] w3) over the unified buffer xu (3 history rows + tk rows)
++static void ssm_direct_fir(const float * restrict xu, const HVX_Vector * restrict wt, float * restrict y, uint32_t tk, uint32_t cth) {
++    const uint32_t nblk = cth / 32;
++    for (uint32_t t = 0; t < tk; ++t) {
++        const HVX_Vector * r0 = (const HVX_Vector *) (xu + (size_t) t * cth);
++        const HVX_Vector * r1 = (const HVX_Vector *) (xu + (size_t) (t + 1) * cth);
++        const HVX_Vector * r2 = (const HVX_Vector *) (xu + (size_t) (t + 2) * cth);
++        const HVX_Vector * r3 = (const HVX_Vector *) (xu + (size_t) (t + 3) * cth);
++        HVX_Vector * yo = (HVX_Vector *) (y + (size_t) t * cth);
++        #pragma clang loop unroll_count(4)
++        for (uint32_t b = 0; b < nblk; ++b) {
++            const HVX_Vector * w = wt + b * 4;
++            HVX_Vector a  = Q6_Vqf32_vadd_Vqf32Vqf32(Q6_Vqf32_vmpy_VsfVsf(r0[b], w[0]), Q6_Vqf32_vmpy_VsfVsf(r1[b], w[1]));
++            HVX_Vector bb = Q6_Vqf32_vadd_Vqf32Vqf32(Q6_Vqf32_vmpy_VsfVsf(r2[b], w[2]), Q6_Vqf32_vmpy_VsfVsf(r3[b], w[3]));
++            yo[b] = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_Vqf32Vqf32(a, bb));
++        }
++    }
++}
++
++// next[3c + k] = the last three x rows of the channel range (same packing as prefill4_hvx's state phase)
++static void ssm_direct_pack_state(const float * restrict r0s, const float * restrict r1s, const float * restrict r2s, float * restrict next, uint32_t cth) {
++    static const HVX_Vector compact = {
++        0x00000000, 0x00000000, 0x00000000, 0x10101010,
++        0x04040404, 0x0c0c0c0c, 0x20202020, 0x2c2c2c2c,
++        0x08080808, 0x10101010, 0x18181818, 0x18181818,
++        0x44444444, 0x44444444, 0x58585858, 0x54545454,
++        0x10101010, 0x10101010, 0x20202020, 0x20202020,
++        0x34343434, 0x3c3c3c3c, 0x30303030, 0x2c2c2c2c,
++        0x08080808, 0x00000000, 0x08080808, 0x08080808,
++        0x34343434, 0x24242424, 0x28282828, 0x24242424
++    };
++    for (uint32_t c = 0; c < cth; c += 32) {
++        HVX_Vector r0 = *(const HVX_Vector *) (r0s + c);
++        HVX_Vector r1 = *(const HVX_Vector *) (r1s + c);
++        HVX_Vector r2 = *(const HVX_Vector *) (r2s + c);
++        HVX_VectorPair ab = Q6_W_vshuff_VVR(r1, r0, -4);
++        HVX_VectorPair cc = Q6_W_vshuff_VVR(r2, r2, -4);
++        HVX_VectorPair lo = Q6_W_vshuff_VVR(Q6_V_lo_W(cc), Q6_V_lo_W(ab), -8);
++        HVX_VectorPair hi = Q6_W_vshuff_VVR(Q6_V_hi_W(cc), Q6_V_hi_W(ab), -8);
++        HVX_Vector a  = Q6_V_vrdelta_VV(Q6_V_lo_W(lo), compact);
++        HVX_Vector b  = Q6_V_vrdelta_VV(Q6_V_hi_W(lo), compact);
++        HVX_Vector c2 = Q6_V_vrdelta_VV(Q6_V_lo_W(hi), compact);
++        HVX_Vector d  = Q6_V_vrdelta_VV(Q6_V_hi_W(hi), compact);
++        HVX_Vector * dst = (HVX_Vector *) (next + 3 * c);
++        dst[0] = Q6_V_valign_VVR(b, Q6_V_vror_VR(a, 96), 32);
++        dst[1] = Q6_V_valign_VVR(c2, Q6_V_vror_VR(b, 96), 64);
++        dst[2] = Q6_V_valign_VVR(d, Q6_V_vror_VR(c2, 96), 96);
++    }
++}
++
++static void ssm_direct_worker_chunked(const htp_thread_t * th, unsigned int nth, unsigned int ith, void * data) {
++    struct ssm_direct_task * task = data;
++    struct htp_ops_context * octx = task->octx;
++    const uint32_t tokens = task->tokens;
++    const uint32_t cth    = task->channels / nth;          // channels of this thread (32-aligned, checked by the op)
++    const uint32_t c0     = ith * cth;
++    const uint32_t tc     = htp_ssm_direct_chunk_tokens(tokens);
++    const uint32_t nchunk = (tokens + tc - 1) / tc;
++    const size_t   row    = (size_t) cth * sizeof(float);
++
++    float * base  = (float *) (octx->ctx->vtcm_base + (size_t) ith * task->per_thread_bytes);
++    float * xb[2] = { base, base + (size_t) (3 + tc) * cth };
++    float * yb[2] = { xb[1] + (size_t) (3 + tc) * cth, xb[1] + (size_t) (3 + tc) * cth + (size_t) tc * cth };
++    HVX_Vector * wt = (HVX_Vector *) (yb[1] + (size_t) tc * cth);           // 4 * cth floats
++    float * next  = (float *) (wt + (cth / 32) * 4);                          // 3 * cth floats
++    float * oldraw = yb[0];                                                   // temp (3 * cth floats, before W0)
++    float * wraw   = yb[1];                                                   // temp (4 * cth floats, before W1)
++    dma_queue * q = th->dma_q;
++    struct htp_thread_trace * tr = th->trace;
++
++    const dma_addr_t x_ddr = octx->src[0]->data + (dma_addr_t) c0 * sizeof(float);
++    const dma_addr_t y_ddr = octx->dsts[1]->data + (dma_addr_t) c0 * sizeof(float);
++    const size_t x_stride  = octx->src[0]->nb[1];
++    const size_t y_stride  = octx->dsts[1]->nb[1];
++
++    #define SSM_CHUNK_TOKENS(k) (((k) + 1 < nchunk) ? tc : (tokens - (k) * tc))
++    #define SSM_PUSH_FETCH(k) \
++        dma_queue_push(q, dma_make_data(xb[(k) & 1] + 3 * cth, x_ddr + (dma_addr_t) (k) * tc * x_stride), row, x_stride, row, SSM_CHUNK_TOKENS(k))
++    #define SSM_PUSH_WRITE(k) \
++        dma_queue_push(q, dma_make_data(y_ddr + (dma_addr_t) (k) * tc * y_stride, yb[(k) & 1]), y_stride, row, row, SSM_CHUNK_TOKENS(k))
++
++    if (!dma_queue_push(q, dma_make_data(oldraw, octx->src[1]->data + (dma_addr_t) 3 * c0 * sizeof(float)), 3 * row, 3 * row, 3 * row, 1) ||
++        !dma_queue_push(q, dma_make_data(wraw,   octx->src[2]->data + (dma_addr_t) 4 * c0 * sizeof(float)), 4 * row, 4 * row, 4 * row, 1) ||
++        !SSM_PUSH_FETCH(0) || (nchunk > 1 && !SSM_PUSH_FETCH(1))) {
++        goto dma_failed;
++    }
++    dma_queue_pop(q);   // old state
++    dma_queue_pop(q);   // weights
++    htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_W_PREP, (uint16_t) ith);
++    ssm_direct_prep_history(oldraw, xb[0], cth);
++    ssm_direct_prep_weights(wraw, wt, cth);
++    htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_W_PREP, (uint16_t) ith);
++
++    for (uint32_t k = 0; k < nchunk; ++k) {
++        const uint32_t tk = SSM_CHUNK_TOKENS(k);
++        float * xu = xb[k & 1];
++        float * yo = yb[k & 1];
++        if (k >= 2) dma_queue_pop(q);   // W(k-2): yb[k & 1] is free again
++        dma_queue_pop(q);               // F(k)
++        htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) k);
++        ssm_direct_fir(xu, wt, yo, tk, cth);
++        if (task->silu) {
++            HVX_Vector * restrict vy = (HVX_Vector *) yo;
++            for (uint32_t i = 0; i < (tk * cth) / 32; ++i) {
++                vy[i] = hvx_vec_silu_f32(vy[i]);
++            }
++        }
++        if (k + 1 < nchunk) {
++            // history for the next chunk = the last three rows of this one (unified index tk .. tk + 2)
++            hvx_copy_f32_aa((uint8_t *) xb[(k + 1) & 1], (const uint8_t *) (xu + (size_t) tk * cth), 3 * cth);
++        } else {
++            ssm_direct_pack_state(xu + (size_t) tk * cth, xu + (size_t) (tk + 1) * cth, xu + (size_t) (tk + 2) * cth, next, cth);
++        }
++        htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) k);
++        if (!SSM_PUSH_WRITE(k) || (k + 2 < nchunk && !SSM_PUSH_FETCH(k + 2))) {
++            goto dma_failed;
++        }
++    }
++    if (!dma_queue_push(q, dma_make_data(octx->dsts[0]->data + (dma_addr_t) 3 * c0 * sizeof(float), next), 3 * row, 3 * row, 3 * row, 1)) {
++        goto dma_failed;
++    }
++    dma_queue_flush(q);
++    #undef SSM_CHUNK_TOKENS
++    #undef SSM_PUSH_FETCH
++    #undef SSM_PUSH_WRITE
++    return;
++dma_failed:
++    dma_queue_flush(q);
++    task->failed[ith] = true;
++}
++
++static int op_ssm_direct(struct htp_ops_context * octx) {
++    const struct htp_ssm_conv_kernel_params * kp = (const struct htp_ssm_conv_kernel_params *) octx->kernel_params;
++    const uint32_t tokens   = kp->n_t;
++    const uint32_t channels = kp->d_inner;
++    struct htp_context * ctx = octx->ctx;
++    if (tokens == 0 || tokens > HTP_SSM_DIRECT_MAX_T || channels == 0 || (channels % HTP_SSM_DIRECT_SLICE) != 0 || ctx->mdev.count > 1) {
++        return HTP_STATUS_NO_SUPPORT;
++    }
++    if (!htp_ops_context_set_n_hvx(octx, kp->n_hvx)) {
++        return HTP_STATUS_CONV_NHVX;
++    }
++    const uint32_t n_hvx = octx->n_hvx;
++    // P2 (chunked prefill, ssm_direct_worker_chunked) is not text-exact on the X Elite (session 5) and gave no
++    // speed-up; every T uses the validated per-slice kernel.
++    const uint32_t per_thread_bytes = htp_ssm_direct_vtcm_bytes_per_thread(tokens);
++    const uint64_t bytes = (uint64_t) per_thread_bytes * n_hvx;
++    if (n_hvx == 0 || n_hvx > HTP_OP_MAX_NTHREADS || kp->vtcm_size != bytes) {
++        return HTP_STATUS_CONV_VTCM;
++    }
++    if (ctx->vtcm_size < bytes || !ctx->vtcm_base || ((uintptr_t) ctx->vtcm_base & 127u)) {
++        return HTP_STATUS_VTCM_TOO_SMALL;
++    }
++    const struct htp_tensor * ts[] = { octx->src[0], octx->src[1], octx->src[2], octx->dsts[0], octx->dsts[1] };
++    if (!ssm_direct_tensor_ok(ctx, ts[0], channels, tokens)) return HTP_STATUS_CONV_T0;
++    if (!ssm_direct_tensor_ok(ctx, ts[1], 3, channels))      return HTP_STATUS_CONV_T1;
++    if (!ssm_direct_tensor_ok(ctx, ts[2], 4, channels))      return HTP_STATUS_CONV_T2;
++    if (!ssm_direct_tensor_ok(ctx, ts[3], 3 * channels, 1))  return HTP_STATUS_CONV_T3;
++    if (!ssm_direct_tensor_ok(ctx, ts[4], channels, tokens)) return HTP_STATUS_CONV_T4;
++    if ((ts[3]->flags | ts[4]->flags) & HTP_TENSOR_WEIGHT)   return HTP_STATUS_CONV_WEIGHT;
++    // outputs must not overlap inputs, except y exactly aliasing x: ggml-alloc reuses x's bytes for the conv
++    // output, and each slice reads its x block into VTCM before its y block is written (slices are disjoint).
++    for (int i = 3; i < 5; ++i) {
++        for (int j = 0; j < i; ++j) {
++            if (i == 4 && j == 0 && ts[4]->data == ts[0]->data && ts[4]->size == ts[0]->size) continue;
++            if (ts[i]->data < ts[j]->data + ts[j]->size && ts[j]->data < ts[i]->data + ts[i]->size) {
++                return HTP_STATUS_CONV_OVERLAP;
++            }
++        }
++    }
++    struct ssm_direct_task task = { .octx = octx, .channels = channels, .tokens = tokens, .silu = kp->silu,
++                                    .per_thread_bytes = per_thread_bytes };
++    work_queue_run(ctx->hvx_queue, ssm_direct_worker, &task, n_hvx);
++    (void) ssm_direct_worker_chunked;
++    for (uint32_t i = 0; i < n_hvx; ++i) {
++        if (task.failed[i]) return HTP_STATUS_INTERNAL_ERR;
++    }
++    FARF(HIGH, "ssm-conv-direct: C %u T %u n_hvx %u silu %u\n", channels, tokens, n_hvx, kp->silu);
++    return HTP_STATUS_OK;
++}
++
+ int op_ssm_conv(struct htp_ops_context * octx) {
++    if (octx->src[2] || octx->dsts[1]) {
++        if (!octx->src[2] || !octx->dsts[1]) {
++            return HTP_STATUS_INVAL_PARAMS;
++        }
++        return op_ssm_direct(octx);
++    }
+     const struct htp_tensor * dst = octx->dst;
+ 
+     switch (dst->type) {
+diff --git a/ggml/src/ggml-hexagon/htp/ssm-conv.h b/ggml/src/ggml-hexagon/htp/ssm-conv.h
+index 7c3f3041f..71c814eac 100644
+--- a/ggml/src/ggml-hexagon/htp/ssm-conv.h
++++ b/ggml/src/ggml-hexagon/htp/ssm-conv.h
+@@ -8,6 +8,31 @@
+ #include "htp-ops.h"
+ #include "htp-vtcm.h"
+ 
++// SSM_CONV_DIRECT (decode): src[0] = x [C, T], src[1] = old state [3, C], src[2] = weight [4, C];
++// dsts[0] = next state [3C, 1] (the recurrent-cache slot), dsts[1] = y [C, T] (SiLU applied when kparams->silu).
++// The host selects it by giving the op three inputs and two outputs; see htp_conv_direct_* in ggml-hexagon.cpp.
++enum { HTP_SSM_DIRECT_SLICE = 128, HTP_SSM_DIRECT_MAX_T = 1024 };   // MAX_T = KDA_MAX_T of the prefill4 kernel
++
++static inline uint32_t htp_ssm_direct_vtcm_bytes_per_thread(uint32_t tokens) {
++    return (2 * tokens + 3 + 4 + 3) * HTP_SSM_DIRECT_SLICE * sizeof(float);
++}
++
++// Prefill (T > 1, x-elite port P2): each HVX thread owns channels/n_hvx channels and streams the tokens in chunks of
++// HTP_SSM_DIRECT_TC rows (wide 2D DMAs: one row = its whole channel range), double-buffered in and out, with the
++// three history rows kept in front of every chunk so the conv is a 4-tap FIR over VTCM rows.
++enum { HTP_SSM_DIRECT_TC = 32 };
++
++static inline uint32_t htp_ssm_direct_chunk_tokens(uint32_t tokens) {
++    return tokens < HTP_SSM_DIRECT_TC ? tokens : HTP_SSM_DIRECT_TC;
++}
++
++// n_hvx threads must split the channels into 32-aligned ranges: channels % (32 * n_hvx) == 0
++static inline uint32_t htp_ssm_direct_vtcm_bytes_per_thread_prefill(uint32_t tokens, uint32_t channels, uint32_t n_hvx) {
++    const uint32_t cth = channels / n_hvx;
++    const uint32_t tc  = htp_ssm_direct_chunk_tokens(tokens);
++    return (2 * (3 + tc) + 2 * tc + 4 + 3) * cth * sizeof(float);
++}
++
+ struct htp_ssm_conv_kernel_params {
+     uint32_t n_hvx;
+     uint32_t d_conv;
+diff --git a/src/models/qwen35.cpp b/src/models/qwen35.cpp
+index 6ec3cff44..ad65e70d7 100644
+--- a/src/models/qwen35.cpp
++++ b/src/models/qwen35.cpp
+@@ -388,6 +388,13 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
+     cb(state, "state_predelta", il);
+ 
+     ggml_tensor * conv_output_proper = ggml_ssm_conv(ctx0, conv_input, conv_kernel);
++    if (n_seqs == 1 && n_seq_tokens >= 1 && n_seq_tokens <= 1024 && conv_kernel_size == 4 && (conv_channels % 128) == 0 &&
++        conv_kernel->ne[1] == conv_channels) {
++        // Pin the unmaterialized operands (old state, new token) for the Hexagon direct conv; ordinary
++        // backends keep using src[0:2].
++        conv_output_proper->src[2] = conv_input->src[0];
++        conv_output_proper->src[3] = qkv_mixed;
++    }
+     cb(conv_output_proper, "conv_output_raw", il);
+ 
+     ggml_tensor * conv_output_silu = ggml_silu(ctx0, conv_output_proper);
+diff --git a/src/models/qwen35moe.cpp b/src/models/qwen35moe.cpp
+index c0ee6fa03..ad248e9b7 100644
+--- a/src/models/qwen35moe.cpp
++++ b/src/models/qwen35moe.cpp
+@@ -398,6 +398,13 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn_linear(
+     cb(state, "state_predelta", il);
+ 
+     ggml_tensor * conv_output_proper = ggml_ssm_conv(ctx0, conv_input, conv_kernel);
++    if (n_seqs == 1 && n_seq_tokens >= 1 && n_seq_tokens <= 1024 && conv_kernel_size == 4 && (conv_channels % 128) == 0 &&
++        conv_kernel->ne[1] == conv_channels) {
++        // Pin the unmaterialized operands (old state, new token) for the Hexagon direct conv; ordinary
++        // backends keep using src[0:2].
++        conv_output_proper->src[2] = conv_input->src[0];
++        conv_output_proper->src[3] = qkv_mixed;
++    }
+     cb(conv_output_proper, "conv_output_raw", il);
+ 
+     ggml_tensor * conv_output_silu = ggml_silu(ctx0, conv_output_proper);

@@ -2,6 +2,12 @@ cmake_minimum_required(VERSION 3.16)
 # C compiler is required by native dependencies.
 project(geniex C CXX)
 
+# Cold Windows builds (no restored cargo cache) link the Rust tokenizers static lib against the
+# runner's current std, which needs WaitOnAddress/WakeByAddress* from synchronization.lib.
+if(WIN32)
+    link_libraries(synchronization)
+endif()
+
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED true)
 set(CMAKE_CXX_STANDARD 17)
@@ -180,7 +186,8 @@ if(GENIEX_PLUGIN_LLAMA_CPP)
     if(GGML_HEXAGON)
         list(APPEND _LLAMA_PATCHES
             "${CMAKE_CURRENT_SOURCE_DIR}/patches/llama-hexagon-release-sessions.patch"
-            "${CMAKE_CURRENT_SOURCE_DIR}/patches/llama-hexagon-power-mode-setter.patch")
+            "${CMAKE_CURRENT_SOURCE_DIR}/patches/llama-hexagon-power-mode-setter.patch"
+            "${CMAKE_CURRENT_SOURCE_DIR}/patches/llama-hexagon-x-elite-35b-port.patch")
     endif()
     if(GGML_OPENCL)
         list(APPEND _LLAMA_PATCHES
