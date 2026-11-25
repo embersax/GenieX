@@ -1,14 +1,15 @@
 diff --git a/ggml/src/ggml-hexagon/ggml-hexagon.cpp b/ggml/src/ggml-hexagon/ggml-hexagon.cpp
-index c38d0005c..1d8baa570 100644
+index c38d0005c..a9894fec1 100644
 --- a/ggml/src/ggml-hexagon/ggml-hexagon.cpp
 +++ b/ggml/src/ggml-hexagon/ggml-hexagon.cpp
-@@ -137,6 +137,14 @@ int    opt_fa_select     = 2; // 2 = HMX -> HVX -> CPU, 1 = HVX -> CPU, 0 = CPU
+@@ -137,6 +137,15 @@ int    opt_fa_select     = 2; // 2 = HMX -> HVX -> CPU, 1 = HVX -> CPU, 0 = CPU
  int    opt_fa_split      = 1; // 1 = head-split + team-split when n_kv_heads < N_cores (default), 0 = off
  int    opt_li_select     = 2; // 2 = HMX -> HVX, 1 = HVX, 0 = CPU (unsupported)
  int    opt_gdn_select    = 2; // 2 = HMX -> HVX, 1 = HVX, 0 = CPU (unsupported)
 +int    opt_gdn_fold      = 1; // decode-time GDN folds: 1 = state-direct + gates, 0 = off (GGML_HEXAGON_GDN_FOLD)
 +int    opt_gdn_depth     = 2; // decode GDN: state buffers per HVX thread in the DMA ring, 2 = stock (GGML_HEXAGON_GDN_DEPTH)
 +int    opt_gdn_wb        = 0; // decode GDN: 1 = HVX-store state write-back instead of DMA (GGML_HEXAGON_GDN_WB)
++int    opt_mmid_cpu_max_rows = 0; // MUL_MAT_ID with fewer activation rows per expert than this stays on the CPU (GGML_HEXAGON_MMID_CPU_MAX_ROWS), 0 = off
 +int    opt_topk_fold     = 0; // ARGSORT + VIEW(first k) solved as TOP_K (GGML_HEXAGON_TOPK_FOLD); default 0: the TOP_K path empties the output on the X Elite (session 5), under investigation
 +int    opt_mv_group      = 0; // decode matmul: weight column tiles per DMA descriptor, one ring for all weights of an NX op (GGML_HEXAGON_MV_GROUP); 0 = stock ring (default: grouping only helps the 8192-row NX op and slows every smaller dense op)
 +size_t opt_batch_vmem    = 0; // cap on the buffer bytes of one op batch (GGML_HEXAGON_BATCH_VMEM, MiB); 0 = max_vmem
@@ -17,7 +18,7 @@ index c38d0005c..1d8baa570 100644
  int    opt_ar_select     = 2; // 2 = fused ALLREDUCE+ADD (default), 1 = unfused ALLREDUCE, 0 = fallback to CPY+FENCE
  int    opt_ar_scatter    = 1; // 1 = reduce-scatter the fused ALLREDUCE+ADD (default), 0 = full reduction
  
-@@ -166,6 +174,15 @@ static const char * status_to_str(uint32_t status) {
+@@ -166,6 +175,15 @@ static const char * status_to_str(uint32_t status) {
              return "VTCM-TOO-SMALL";
          case HTP_STATUS_INTERNAL_ERR:
              return "INTERNAL-ERROR";
@@ -33,7 +34,7 @@ index c38d0005c..1d8baa570 100644
          default:
              return "UNKNOWN";
      }
-@@ -1215,7 +1232,8 @@ struct ggml_hexagon_opbatch {
+@@ -1215,7 +1233,8 @@ struct ggml_hexagon_opbatch {
      unsigned int n_bufs_max;
      unsigned int n_tens_max;
      unsigned int n_ops_max;
@@ -43,7 +44,7 @@ index c38d0005c..1d8baa570 100644
  
      void reset() {
          n_bufs = 0;
-@@ -1234,7 +1252,8 @@ struct ggml_hexagon_opbatch {
+@@ -1234,7 +1253,8 @@ struct ggml_hexagon_opbatch {
          n_ops_max  = batch_size;
          n_tens_max = std::min<size_t>(n_ops_max * 4 + HTP_OP_MAX_INPUTS + HTP_OP_MAX_OUTPUTS, HTP_OP_MAX_TENSORS);
  
@@ -53,7 +54,7 @@ index c38d0005c..1d8baa570 100644
  
          ops.resize(n_ops_max);
  
-@@ -1422,9 +1441,16 @@ struct ggml_hexagon_opbatch {
+@@ -1422,9 +1442,16 @@ struct ggml_hexagon_opbatch {
              fit_tensor(output);
          }
  
@@ -73,7 +74,7 @@ index c38d0005c..1d8baa570 100644
  
          return true;
      }
-@@ -2440,6 +2466,360 @@ static void ggml_hexagon_graph_repack(const ggml_cgraph * graph, ggml_hexagon_se
+@@ -2440,6 +2467,360 @@ static void ggml_hexagon_graph_repack(const ggml_cgraph * graph, ggml_hexagon_se
      }
  }
  
@@ -434,7 +435,7 @@ index c38d0005c..1d8baa570 100644
  static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, ggml_cgraph * graph) {
      auto sess = static_cast<ggml_hexagon_session *>(backend->context);
  
-@@ -2462,9 +2842,17 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
+@@ -2462,9 +2843,17 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
  
          computed_nodes.reserve(graph->n_nodes);
  
@@ -453,7 +454,7 @@ index c38d0005c..1d8baa570 100644
                  continue;
              }
  
-@@ -2473,8 +2861,40 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
+@@ -2473,8 +2862,40 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
                  GGML_ABORT("\nggml-hex: graph-compute %s is not supported\n", ggml_op_desc(n));
              }
  
@@ -496,7 +497,25 @@ index c38d0005c..1d8baa570 100644
  
              computed_nodes.push_back(std::move(node));
          }
-@@ -3468,6 +3888,14 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
+@@ -3057,6 +3478,17 @@ static bool ggml_backend_hexagon_device_supports_op(ggml_backend_dev_t dev, cons
+         return false;
+     }
+ 
++    // x-elite port (H1): phase-dependent MoE placement. Below GGML_HEXAGON_MMID_CPU_MAX_ROWS activation rows per
++    // expert (decode: 0, 512-token prefill: 16) the expert matmuls are left to the CPU, whose bandwidth beats the
++    // NPU on them; above it (1024 tokens: 32 rows) the HMX path wins and keeps them.
++    if (opt_mmid_cpu_max_rows > 0 && op->op == GGML_OP_MUL_MAT_ID && op->src[0] && op->src[1]) {
++        const int64_t n_as = op->src[0]->ne[2];
++        const int64_t rows = op->src[1]->ne[1] * op->src[1]->ne[2] * op->src[1]->ne[3];
++        if (n_as > 0 && rows / n_as < opt_mmid_cpu_max_rows) {
++            return false;
++        }
++    }
++
+     bool supp = false;
+     if (ggml_op_is_empty(op->op) || ggml_is_empty(op)) {
+         supp = true;
+@@ -3468,6 +3900,15 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
      const char * str_fa_split  = getenv("GGML_HEXAGON_FA_SPLIT");
      const char * str_li_select = getenv("GGML_HEXAGON_LI_SELECT");
      const char * str_gdn_select = getenv("GGML_HEXAGON_GDN_SELECT");
@@ -505,13 +524,14 @@ index c38d0005c..1d8baa570 100644
 +    const char * str_mv_group = getenv("GGML_HEXAGON_MV_GROUP");
 +    const char * str_gdn_wb = getenv("GGML_HEXAGON_GDN_WB");
 +    const char * str_topk_fold = getenv("GGML_HEXAGON_TOPK_FOLD");
++    const char * str_mmid_cpu = getenv("GGML_HEXAGON_MMID_CPU_MAX_ROWS");
 +    const char * str_conv_fold = getenv("GGML_HEXAGON_CONV_FOLD");
 +    const char * str_batch_vmem = getenv("GGML_HEXAGON_BATCH_VMEM");
 +    const char * str_mmid_hmx = getenv("GGML_HEXAGON_MMID_HMX_MIN_ROWS");
      const char * str_ar_select = getenv("GGML_HEXAGON_AR_SELECT");
      const char * str_ar_scatter = getenv("GGML_HEXAGON_AR_SCATTER");
      const char * str_ndev     = getenv("GGML_HEXAGON_NDEV");
-@@ -3535,6 +3963,14 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
+@@ -3535,6 +3976,15 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
      opt_fa_split  = str_fa_split  ? atoi(str_fa_split)                   : opt_fa_split;
      opt_li_select = str_li_select ? atoi(str_li_select)                   : opt_li_select;
      opt_gdn_select    = str_gdn_select    ? atoi(str_gdn_select)          : opt_gdn_select;
@@ -520,6 +540,7 @@ index c38d0005c..1d8baa570 100644
 +    opt_mv_group      = str_mv_group      ? atoi(str_mv_group)            : opt_mv_group;
 +    opt_gdn_wb        = str_gdn_wb        ? atoi(str_gdn_wb)              : opt_gdn_wb;
 +    opt_topk_fold     = str_topk_fold     ? atoi(str_topk_fold)           : opt_topk_fold;
++    opt_mmid_cpu_max_rows = str_mmid_cpu  ? atoi(str_mmid_cpu)            : opt_mmid_cpu_max_rows;
 +    opt_conv_fold     = str_conv_fold     ? atoi(str_conv_fold)           : opt_conv_fold;
 +    opt_batch_vmem    = str_batch_vmem    ? strtoul(str_batch_vmem, NULL, 0) * 1024u * 1024u : opt_batch_vmem;
 +    opt_mmid_hmx_min_rows = str_mmid_hmx  ? atoi(str_mmid_hmx)               : opt_mmid_hmx_min_rows;
