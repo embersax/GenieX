@@ -666,10 +666,19 @@ index 7c4b97307..b7f40a729 100644
  
  // First set of values must match the ggml_type.
 diff --git a/ggml/src/ggml-hexagon/htp/main.c b/ggml/src/ggml-hexagon/htp/main.c
-index ad457d1a6..04bddf710 100644
+index ad457d1a6..d93645b35 100644
 --- a/ggml/src/ggml-hexagon/htp/main.c
 +++ b/ggml/src/ggml-hexagon/htp/main.c
-@@ -707,6 +707,9 @@ AEEResult htp_iface_start(remote_handle64 handle, uint32_t sess_id, uint64_t dsp
+@@ -16,6 +16,8 @@
+ #include <qurt.h>
+ #include <qurt_thread.h>
+ #include <qurt_memory.h>
++
++#define PREP_THREAD_STACK_SIZE (64 * 1024)   // x-elite port (candidate A): stack of the htp-prep helper thread
+ #include <remote.h>
+ #include <string.h>
+ #include <stdatomic.h>
+@@ -707,6 +709,9 @@ AEEResult htp_iface_start(remote_handle64 handle, uint32_t sess_id, uint64_t dsp
          qurt_thread_attr_set_stack_size(&attr, size_main_stack);
          qurt_thread_attr_set_priority(&attr, main_prio);
          qurt_thread_attr_set_name(&attr, "htp-main");
@@ -679,7 +688,7 @@ index ad457d1a6..04bddf710 100644
  
          int err_thread = qurt_thread_create(&ctx->main_thread, &attr, htp_main_thread, ctx);
          if (err_thread) {
-@@ -733,6 +736,7 @@ AEEResult htp_iface_stop(remote_handle64 handle) {
+@@ -733,6 +738,7 @@ AEEResult htp_iface_stop(remote_handle64 handle) {
          atomic_store(&ctx->killed, true);
          int status;
          (void) qurt_thread_join(ctx->main_thread, &status);
@@ -687,7 +696,7 @@ index ad457d1a6..04bddf710 100644
          ctx->main_thread = 0;
      }
  
-@@ -1141,7 +1145,43 @@ static inline bool mmap_buf(struct htp_context *ctx, struct htp_buf_desc *b) {
+@@ -1141,7 +1147,43 @@ static inline bool mmap_buf(struct htp_context *ctx, struct htp_buf_desc *b) {
      return false;
  }
  
@@ -732,7 +741,7 @@ index ad457d1a6..04bddf710 100644
      uint32_t m_reuse = 0; // mmap reuse mask (index from ctx->mmap array)
      uint32_t b_reuse = 0; // buf reuse count
  
-@@ -1159,7 +1199,7 @@ static void prep_op_bufs(struct htp_context *ctx, struct htp_buf_desc *bufs, uin
+@@ -1159,7 +1201,7 @@ static void prep_op_bufs(struct htp_context *ctx, struct htp_buf_desc *bufs, uin
          FARF(HIGH, "prep-buf #%u : pass0 fd %u base 0x%llx size %llu flags 0x%x", i, b->fd, (unsigned long long) b->base, (unsigned long long) b->size, b->flags);
      }
  
@@ -741,7 +750,7 @@ index ad457d1a6..04bddf710 100644
  
      // See how much vmem we have mmaped right now
      for (uint32_t i=0; i<HTP_MAX_MMAPS; i++) {
-@@ -1174,7 +1214,7 @@ static void prep_op_bufs(struct htp_context *ctx, struct htp_buf_desc *bufs, uin
+@@ -1174,7 +1216,7 @@ static void prep_op_bufs(struct htp_context *ctx, struct htp_buf_desc *bufs, uin
      if ((m_vmem + e_vmem) > ctx->max_vmem) {
          // Drop unused mappings
          for (uint32_t i=0; i < HTP_MAX_MMAPS; i++) {
@@ -750,7 +759,7 @@ index ad457d1a6..04bddf710 100644
              if (!used && !(ctx->mmap[i].flags & HTP_BUF_EXTENDED)) {
                  drop_mmap(ctx, ctx->mmap + i);
              }
-@@ -1192,6 +1232,11 @@ static void prep_op_bufs(struct htp_context *ctx, struct htp_buf_desc *bufs, uin
+@@ -1192,6 +1234,11 @@ static void prep_op_bufs(struct htp_context *ctx, struct htp_buf_desc *bufs, uin
          FARF(HIGH, "prep-buf #%u : pass1 fd %u base 0x%llx size %llu flags 0x%x", i, b->fd, (unsigned long long) b->base, (unsigned long long) b->size, b->flags);
      }
  
@@ -762,7 +771,7 @@ index ad457d1a6..04bddf710 100644
      if (!mmap_ok) {
          // Attempt defragmentation: drop 32-bit mappings and remap (pass 2)
          FARF(HIGH, "prep-bufs : dropping 32-bit mappings to defragment address space");
-@@ -1213,6 +1258,7 @@ static void prep_op_bufs(struct htp_context *ctx, struct htp_buf_desc *bufs, uin
+@@ -1213,6 +1260,7 @@ static void prep_op_bufs(struct htp_context *ctx, struct htp_buf_desc *bufs, uin
              FARF(HIGH, "prep-buf #%u : pass2 fd %u base 0x%llx size %llu flags 0x%x", i, b->fd, (unsigned long long) b->base, (unsigned long long) b->size, b->flags);
          }
      }
@@ -770,7 +779,7 @@ index ad457d1a6..04bddf710 100644
  }
  
  static void prep_tensor(struct htp_context *ctx, struct htp_buf_desc *bufs, struct htp_tensor *tens, uint32_t idx, struct htp_tensor *t) {
-@@ -1342,7 +1388,8 @@ static void process_opbatch(struct htp_context * ctx, const struct htp_opbatch_r
+@@ -1342,7 +1390,8 @@ static void process_opbatch(struct htp_context * ctx, const struct htp_opbatch_r
      htp_trace_event_stop(&ctx->trace[0], HTP_TRACE_EVT_L2FLUSH, 0);
  
      htp_trace_event_start(&ctx->trace[0], HTP_TRACE_EVT_BUFF, 0);
@@ -780,7 +789,7 @@ index ad457d1a6..04bddf710 100644
      htp_trace_event_stop(&ctx->trace[0], HTP_TRACE_EVT_BUFF, 0);
  
      prep_tensors(ctx, bufs, tens, n_tens);
-@@ -1426,6 +1473,25 @@ static void process_opbatch(struct htp_context * ctx, const struct htp_opbatch_r
+@@ -1426,6 +1475,23 @@ static void process_opbatch(struct htp_context * ctx, const struct htp_opbatch_r
  #define DSPQUEUE_POLL_TIMEOUT_USEC 100
  #define DSPQUEUE_POLL_COUNT        100
  
@@ -800,8 +809,6 @@ index ad457d1a6..04bddf710 100644
 +    job->done = prep_op_bufs(job->ctx, job->bufs, job->n_bufs, job->protect) ? 1 : -1;
 +    qurt_thread_exit(0);
 +}
-+
-+#define PREP_THREAD_STACK_SIZE (64 * 1024)
 +
  static void process_ops(struct htp_context * ctx) {
      dspqueue_t queue = ctx->dsp_queue;
