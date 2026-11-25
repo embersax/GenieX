@@ -1870,7 +1870,7 @@ index ad457d1a6..d93645b35 100644
  
      vtcm_release(ctx);
 diff --git a/ggml/src/ggml-hexagon/htp/matmul-ops.c b/ggml/src/ggml-hexagon/htp/matmul-ops.c
-index fb15310cf..25deba0e0 100644
+index fb15310cf..4100b94e3 100644
 --- a/ggml/src/ggml-hexagon/htp/matmul-ops.c
 +++ b/ggml/src/ggml-hexagon/htp/matmul-ops.c
 @@ -248,6 +248,175 @@ static const uint8_t __attribute__((aligned(VLEN))) kvalues_mxfp4_lut[] = {
@@ -2291,7 +2291,7 @@ index fb15310cf..25deba0e0 100644
  }
  
  static void hvx_mm_id_nx_tiled(const htp_thread_t * th, unsigned int nth, unsigned int ith, void * data) {
-@@ -3435,6 +3587,80 @@ static void transfer_activation_chunk_gathered_threaded(
+@@ -3435,6 +3587,84 @@ static void transfer_activation_chunk_gathered_threaded(
      work_queue_run(ctx->hvx_queue, worker_fn, &state, actual_hvx);
  }
  
@@ -2313,7 +2313,11 @@ index fb15310cf..25deba0e0 100644
 +    const uint32_t vtcm_start_row = i * st->n_chunks_per_task;
 +    if (vtcm_start_row >= st->n_rows) return;
 +    const uint32_t n_rows = hex_smin(st->n_rows - vtcm_start_row, st->n_chunks_per_task);
-+    const uint32_t n_valid = st->n_rows_valid > vtcm_start_row ? hex_smin(st->n_rows_valid - vtcm_start_row, n_rows) : 0;
++    // The conversion pads its sub-chunk to whole 32-row tiles, so it also writes rows that belong to the next
++    // worker; like the direct gather, those rows must carry the real data (the stage holds the whole chunk), not
++    // zeros, or the two workers race and the later one wins. Valid rows are therefore counted from this worker's
++    // start to the end of the chunk's valid rows, not capped at its own sub-chunk.
++    const uint32_t n_valid = st->n_rows_valid > vtcm_start_row ? st->n_rows_valid - vtcm_start_row : 0;
 +    htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_A_PREP, i);
 +    transfer_activation_chunk_fp32_to_fp16_staged(st->dst, st->stage + (size_t) vtcm_start_row * st->k_block,
 +                                                  vtcm_start_row, n_rows, n_valid, st->k_block, st->k_valid);
@@ -2372,7 +2376,7 @@ index fb15310cf..25deba0e0 100644
  static void transfer_output_chunk_scattered_threaded(
              struct htp_context *ctx,
              float *dst,
-@@ -3493,7 +3719,8 @@ static int hmx_mm_id_2d_f32(struct htp_context *ctx,
+@@ -3493,7 +3723,8 @@ static int hmx_mm_id_2d_f32(struct htp_context *ctx,
                                           int mapping_stride,
                                           int m_start,
                                           int m_end,
@@ -2382,7 +2386,7 @@ index fb15310cf..25deba0e0 100644
      struct htp_thread_trace * tr = &ctx->trace[0];
      htp_trace_event_start(tr, HTP_TRACE_EVT_INIT, 0);
  
-@@ -3532,6 +3759,7 @@ static int hmx_mm_id_2d_f32(struct htp_context *ctx,
+@@ -3532,6 +3763,7 @@ static int hmx_mm_id_2d_f32(struct htp_context *ctx,
                                    &size_per_n, &size_per_m, &size_per_mn);
  
      const size_t overhead = htp_mm_hmx_get_2d_overhead(/*pipeline=*/false, /*is_matmul_id=*/true);
@@ -2390,7 +2394,7 @@ index fb15310cf..25deba0e0 100644
      size_t m_chunk_n_rows = 0, n_chunk_n_cols = 0;
      if (htp_mm_hmx_compute_chunks(vtcm_budget, overhead, size_per_n, size_per_m, size_per_mn,
                             m_core_padded, n,
-@@ -3553,6 +3781,7 @@ static int hmx_mm_id_2d_f32(struct htp_context *ctx,
+@@ -3553,6 +3785,7 @@ static int hmx_mm_id_2d_f32(struct htp_context *ctx,
      __fp16  *vtcm_output   = (__fp16 *) vtcm_seq_alloc(&vtcm_ptr, output_area_size);
      void    *vtcm_scratch0 = vtcm_seq_alloc(&vtcm_ptr, scratch0_size);
      __fp16  *vtcm_scales   = (__fp16 *) vtcm_seq_alloc(&vtcm_ptr, 256);
@@ -2398,7 +2402,7 @@ index fb15310cf..25deba0e0 100644
  
      vtcm_used = vtcm_ptr - (uint8_t *) ctx->vtcm_base;
      if (vtcm_used > vtcm_budget) {
-@@ -3573,9 +3802,17 @@ static int hmx_mm_id_2d_f32(struct htp_context *ctx,
+@@ -3573,9 +3806,17 @@ static int hmx_mm_id_2d_f32(struct htp_context *ctx,
          const size_t n_rows = hex_smin((size_t) m_end - mr, m_chunk_n_rows);
          const size_t n_row_tiles = hmx_ceil_div(n_rows, HTP_MM_HMX_TILE_N_ROWS);
  
@@ -2419,7 +2423,7 @@ index fb15310cf..25deba0e0 100644
  
          // A0: Pre-fetch the first weight chunk (nc = 0)
          if (n > 0) {
-@@ -3756,6 +3993,159 @@ int op_matmul(struct htp_ops_context * octx) {
+@@ -3756,6 +3997,159 @@ int op_matmul(struct htp_ops_context * octx) {
      return op_matmul_impl(octx);
  }
  
@@ -2579,7 +2583,7 @@ index fb15310cf..25deba0e0 100644
  static int hmx_mm_op_matmul_id(
      struct htp_ops_context * octx,
      struct htp_mm_context * mmctx
-@@ -3767,6 +4157,16 @@ static int hmx_mm_op_matmul_id(
+@@ -3767,6 +4161,16 @@ static int hmx_mm_op_matmul_id(
      const int n_ids = octx->src[2]->ne[0];
      const int n_as  = ne02;
  
@@ -2596,7 +2600,7 @@ index fb15310cf..25deba0e0 100644
      const bool mdev_split = (octx->ctx->mdev.count > 1) && htp_tensor_can_row_partition(dst, sizeof(float));
      if (octx->ctx->mdev.count > 1 && !mdev_split && octx->ctx->mdev.idx > 0) {
          return HTP_STATUS_OK;
-@@ -3810,7 +4210,7 @@ static int hmx_mm_op_matmul_id(
+@@ -3810,7 +4214,7 @@ static int hmx_mm_op_matmul_id(
                                     (int) src0->nb[1], (int) src0->type,
                                     kparams->tile_size, kparams->aligned_tile_size,
                                     matrix_rows, cur_a, mmctx->mapping_stride,
@@ -2605,7 +2609,7 @@ index fb15310cf..25deba0e0 100644
          if (ret != 0) {
              FARF(ERROR, "HMX matmul failed for expert %u, error %d\n", cur_a, ret);
              return HTP_STATUS_NO_SUPPORT;
-@@ -3922,6 +4322,25 @@ static int hmx_mm_op_matmul_id_nx(
+@@ -3922,6 +4326,25 @@ static int hmx_mm_op_matmul_id_nx(
      const struct htp_tensor * restrict act  = octx->src[n_weights];
      const int n_as = src0->ne[2];
  
@@ -2631,7 +2635,7 @@ index fb15310cf..25deba0e0 100644
      bool mdev_split = (octx->ctx->mdev.count > 1);
      for (uint32_t p = 0; p < n_weights && mdev_split; ++p) {
          const struct htp_tensor * restrict dst = octx->dsts[p];
-@@ -3974,7 +4393,7 @@ static int hmx_mm_op_matmul_id_nx(
+@@ -3974,7 +4397,7 @@ static int hmx_mm_op_matmul_id_nx(
                                         (int) src_w->nb[1], (int) src_w->type,
                                         kparams->tile_size, kparams->aligned_tile_size,
                                         matrix_rows, cur_a, mmctx->mapping_stride,
