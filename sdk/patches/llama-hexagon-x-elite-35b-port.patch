@@ -1,19 +1,20 @@
 diff --git a/ggml/src/ggml-hexagon/ggml-hexagon.cpp b/ggml/src/ggml-hexagon/ggml-hexagon.cpp
-index c38d0005c..a1366ef1e 100644
+index c38d0005c..9126b1787 100644
 --- a/ggml/src/ggml-hexagon/ggml-hexagon.cpp
 +++ b/ggml/src/ggml-hexagon/ggml-hexagon.cpp
-@@ -137,6 +137,10 @@ int    opt_fa_select     = 2; // 2 = HMX -> HVX -> CPU, 1 = HVX -> CPU, 0 = CPU
+@@ -137,6 +137,11 @@ int    opt_fa_select     = 2; // 2 = HMX -> HVX -> CPU, 1 = HVX -> CPU, 0 = CPU
  int    opt_fa_split      = 1; // 1 = head-split + team-split when n_kv_heads < N_cores (default), 0 = off
  int    opt_li_select     = 2; // 2 = HMX -> HVX, 1 = HVX, 0 = CPU (unsupported)
  int    opt_gdn_select    = 2; // 2 = HMX -> HVX, 1 = HVX, 0 = CPU (unsupported)
 +int    opt_gdn_fold      = 1; // decode-time GDN folds: 1 = state-direct + gates, 0 = off (GGML_HEXAGON_GDN_FOLD)
++int    opt_gdn_depth     = 2; // decode GDN: state buffers per HVX thread in the DMA ring, 2 = stock (GGML_HEXAGON_GDN_DEPTH)
 +size_t opt_batch_vmem    = 0; // cap on the buffer bytes of one op batch (GGML_HEXAGON_BATCH_VMEM, MiB); 0 = max_vmem
 +int    opt_mmid_hmx_min_rows = 0; // MUL_MAT_ID: use HVX below this many activation rows per expert (GGML_HEXAGON_MMID_HMX_MIN_ROWS), 0 = stock
 +int    opt_conv_fold     = 1; // decode-time direct ssm-conv fold (CONCAT+CPY+SSM_CONV[+SILU]), 0 = off (GGML_HEXAGON_CONV_FOLD)
  int    opt_ar_select     = 2; // 2 = fused ALLREDUCE+ADD (default), 1 = unfused ALLREDUCE, 0 = fallback to CPY+FENCE
  int    opt_ar_scatter    = 1; // 1 = reduce-scatter the fused ALLREDUCE+ADD (default), 0 = full reduction
  
-@@ -166,6 +170,15 @@ static const char * status_to_str(uint32_t status) {
+@@ -166,6 +171,15 @@ static const char * status_to_str(uint32_t status) {
              return "VTCM-TOO-SMALL";
          case HTP_STATUS_INTERNAL_ERR:
              return "INTERNAL-ERROR";
@@ -29,7 +30,7 @@ index c38d0005c..a1366ef1e 100644
          default:
              return "UNKNOWN";
      }
-@@ -1234,7 +1247,7 @@ struct ggml_hexagon_opbatch {
+@@ -1234,7 +1248,7 @@ struct ggml_hexagon_opbatch {
          n_ops_max  = batch_size;
          n_tens_max = std::min<size_t>(n_ops_max * 4 + HTP_OP_MAX_INPUTS + HTP_OP_MAX_OUTPUTS, HTP_OP_MAX_TENSORS);
  
@@ -38,7 +39,7 @@ index c38d0005c..a1366ef1e 100644
  
          ops.resize(n_ops_max);
  
-@@ -1422,9 +1435,15 @@ struct ggml_hexagon_opbatch {
+@@ -1422,9 +1436,15 @@ struct ggml_hexagon_opbatch {
              fit_tensor(output);
          }
  
@@ -57,7 +58,7 @@ index c38d0005c..a1366ef1e 100644
  
          return true;
      }
-@@ -2440,6 +2459,332 @@ static void ggml_hexagon_graph_repack(const ggml_cgraph * graph, ggml_hexagon_se
+@@ -2440,6 +2460,332 @@ static void ggml_hexagon_graph_repack(const ggml_cgraph * graph, ggml_hexagon_se
      }
  }
  
@@ -390,7 +391,7 @@ index c38d0005c..a1366ef1e 100644
  static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, ggml_cgraph * graph) {
      auto sess = static_cast<ggml_hexagon_session *>(backend->context);
  
-@@ -2462,9 +2807,15 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
+@@ -2462,9 +2808,15 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
  
          computed_nodes.reserve(graph->n_nodes);
  
@@ -407,7 +408,7 @@ index c38d0005c..a1366ef1e 100644
                  continue;
              }
  
-@@ -2476,6 +2827,25 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
+@@ -2476,6 +2828,25 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
              htp_opnode node(opcode, n);
              GGML_ASSERT(htp_kparams_solve(sess, node));
  
@@ -433,22 +434,24 @@ index c38d0005c..a1366ef1e 100644
              computed_nodes.push_back(std::move(node));
          }
  
-@@ -3468,6 +3838,10 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
+@@ -3468,6 +3839,11 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
      const char * str_fa_split  = getenv("GGML_HEXAGON_FA_SPLIT");
      const char * str_li_select = getenv("GGML_HEXAGON_LI_SELECT");
      const char * str_gdn_select = getenv("GGML_HEXAGON_GDN_SELECT");
 +    const char * str_gdn_fold = getenv("GGML_HEXAGON_GDN_FOLD");
++    const char * str_gdn_depth = getenv("GGML_HEXAGON_GDN_DEPTH");
 +    const char * str_conv_fold = getenv("GGML_HEXAGON_CONV_FOLD");
 +    const char * str_batch_vmem = getenv("GGML_HEXAGON_BATCH_VMEM");
 +    const char * str_mmid_hmx = getenv("GGML_HEXAGON_MMID_HMX_MIN_ROWS");
      const char * str_ar_select = getenv("GGML_HEXAGON_AR_SELECT");
      const char * str_ar_scatter = getenv("GGML_HEXAGON_AR_SCATTER");
      const char * str_ndev     = getenv("GGML_HEXAGON_NDEV");
-@@ -3535,6 +3909,10 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
+@@ -3535,6 +3911,11 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
      opt_fa_split  = str_fa_split  ? atoi(str_fa_split)                   : opt_fa_split;
      opt_li_select = str_li_select ? atoi(str_li_select)                   : opt_li_select;
      opt_gdn_select    = str_gdn_select    ? atoi(str_gdn_select)          : opt_gdn_select;
 +    opt_gdn_fold      = str_gdn_fold      ? atoi(str_gdn_fold)            : opt_gdn_fold;
++    opt_gdn_depth     = str_gdn_depth     ? atoi(str_gdn_depth)           : opt_gdn_depth;
 +    opt_conv_fold     = str_conv_fold     ? atoi(str_conv_fold)           : opt_conv_fold;
 +    opt_batch_vmem    = str_batch_vmem    ? strtoul(str_batch_vmem, NULL, 0) * 1024u * 1024u : opt_batch_vmem;
 +    opt_mmid_hmx_min_rows = str_mmid_hmx  ? atoi(str_mmid_hmx)               : opt_mmid_hmx_min_rows;
@@ -456,14 +459,15 @@ index c38d0005c..a1366ef1e 100644
      opt_ar_scatter    = str_ar_scatter    ? atoi(str_ar_scatter)          : opt_ar_scatter;
  
 diff --git a/ggml/src/ggml-hexagon/htp-common.h b/ggml/src/ggml-hexagon/htp-common.h
-index 4e9e54415..639a10478 100644
+index 4e9e54415..c27d55e50 100644
 --- a/ggml/src/ggml-hexagon/htp-common.h
 +++ b/ggml/src/ggml-hexagon/htp-common.h
-@@ -25,6 +25,10 @@ extern int    opt_fa_select;
+@@ -25,6 +25,11 @@ extern int    opt_fa_select;
  extern int    opt_fa_split;
  extern int    opt_li_select;
  extern int    opt_gdn_select;
 +extern int    opt_gdn_fold;
++extern int    opt_gdn_depth;
 +extern int    opt_conv_fold;
 +extern size_t opt_batch_vmem;
 +extern int    opt_mmid_hmx_min_rows;
@@ -487,10 +491,39 @@ index eb0862669..a70ca6ef3 100644
      if (htp_tensors_overlap(dst, prev.src0()) || htp_tensors_overlap(dst, prev.src1())) return false;
  
 diff --git a/ggml/src/ggml-hexagon/htp-kparams.cpp b/ggml/src/ggml-hexagon/htp-kparams.cpp
-index 2fbd419ac..21a3f80a8 100644
+index 2fbd419ac..ef808d4e2 100644
 --- a/ggml/src/ggml-hexagon/htp-kparams.cpp
 +++ b/ggml/src/ggml-hexagon/htp-kparams.cpp
-@@ -1118,7 +1118,12 @@ bool htp_kparams_solve_mmnx(
+@@ -567,6 +567,7 @@ static bool htp_kparams_solve_gated_delta_net(
+     struct htp_gdn_hmx_vtcm_layout hmx_layout;
+     struct htp_gdn_vtcm_layout hvx_layout;
+     uint32_t n_heads_batch = 1;
++    uint32_t gdn_depth = (opt_gdn_depth < 2) ? 2 : ((opt_gdn_depth > 8) ? 8 : (uint32_t) opt_gdn_depth);
+ 
+     if (can_use_hmx && htp_gdn_hmx_solve_layout(&hmx_layout, (uint32_t) S_v, HTP_GDN_CHUNK_SIZE, total_rows, vtcm_size, n_hvx, true, &n_heads_batch)) {
+         kparams->kernel_type   = HTP_GDN_KERNEL_HMX_CHUNKED;
+@@ -576,7 +577,11 @@ static bool htp_kparams_solve_gated_delta_net(
+         kparams->n_heads_batch = (uint16_t) n_heads_batch;
+         kparams->vtcm_size     = (uint32_t) hmx_layout.total_bytes;
+     } else {
+-        htp_gdn_vtcm_layout_build(&hvx_layout, (uint32_t) S_v, n_hvx);
++        htp_gdn_vtcm_layout_build(&hvx_layout, (uint32_t) S_v, n_hvx, gdn_depth);
++        while (hvx_layout.total_bytes > vtcm_size && gdn_depth > 2) {
++            gdn_depth--;
++            htp_gdn_vtcm_layout_build(&hvx_layout, (uint32_t) S_v, n_hvx, gdn_depth);
++        }
+         if (hvx_layout.total_bytes > vtcm_size) {
+             return false;
+         }
+@@ -587,6 +592,7 @@ static bool htp_kparams_solve_gated_delta_net(
+     }
+ 
+     kparams->n_hvx               = n_hvx;
++    kparams->prefetch_depth      = gdn_depth;
+     kparams->S_v                 = (uint32_t) S_v;
+     kparams->H                   = (uint32_t) H;
+     kparams->n_tokens            = (uint32_t) n_tokens;
+@@ -1118,7 +1124,12 @@ bool htp_kparams_solve_mmnx(
      const int  ne01_tiled  = hex_round_up(ne01, 32);
      const bool is_batched  = (ne02 * ne03 > 1 || ne12 * ne13 > 1);
  
@@ -504,7 +537,7 @@ index 2fbd419ac..21a3f80a8 100644
      if (hmx_enabled && htp_matmul_is_hmx_eligible(src0, act, nullptr, false, is_batched)) {
          if (htp_kparams_solve_hmx_mm(sess, src0, act, nullptr, wtype, ne00_padded, ne01_tiled, ne02, ne11, ne12, ne11_padded, false, is_batched, 0, vtcm_budget, kparams)) {
              kparams->n_weights = n_weights;
-@@ -1136,7 +1141,9 @@ bool htp_kparams_solve_mmnx(
+@@ -1136,7 +1147,9 @@ bool htp_kparams_solve_mmnx(
          const size_t act_row_size  = htp_mm_tiled_act_row_size(wtype, ne10);
          const size_t src0_row_size = src0->nb[1];
  
@@ -516,7 +549,7 @@ index 2fbd419ac..21a3f80a8 100644
          for (uint32_t d = max_prefetch; d >= 2; d /= 2) {
              struct htp_mm_hvx_vtcm_layout L;
 diff --git a/ggml/src/ggml-hexagon/htp/gated-delta-net-ops.c b/ggml/src/ggml-hexagon/htp/gated-delta-net-ops.c
-index 0280f99a4..05e25e0bf 100644
+index 0280f99a4..e7ad67a6c 100644
 --- a/ggml/src/ggml-hexagon/htp/gated-delta-net-ops.c
 +++ b/ggml/src/ggml-hexagon/htp/gated-delta-net-ops.c
 @@ -8,6 +8,7 @@
@@ -598,7 +631,26 @@ index 0280f99a4..05e25e0bf 100644
  static void gated_delta_net_f32_tg_thread(const htp_thread_t * th, unsigned int nth, unsigned int ith, void * data) {
      struct htp_gdn_context * gctx = (struct htp_gdn_context *) data;
      struct htp_ops_context * octx = gctx->octx;
-@@ -930,7 +995,12 @@ static void gated_delta_net_f32_tg_thread(const htp_thread_t * th, unsigned int
+@@ -920,9 +985,16 @@ static void gated_delta_net_f32_tg_thread(const htp_thread_t * th, unsigned int
+ 
+     dma_queue * dma_q = th->dma_q;
+     const struct htp_gdn_vtcm_layout * layout = &gctx->layout;
+-    float * s_work[2];
++    // Ring of `depth` state buffers per thread: fetches for the next depth-1 heads stay queued behind the
++    // current head's write-back (DMA queue is in order), so the DMA engine always has work in flight.
++    uint32_t depth = kparams->prefetch_depth;
++    if (depth < 2) depth = 2;
++    if (depth > HTP_GDN_MAX_DEPTH) depth = HTP_GDN_MAX_DEPTH;
++    float * s_work[HTP_GDN_MAX_DEPTH];
+     s_work[0] = (float *) (gctx->vtcm_base + layout->bytes_per_hvx * ith);
+-    s_work[1] = s_work[0] + layout->state_aligned / sizeof(float);
++    for (uint32_t d = 1; d < depth; d++) {
++        s_work[d] = s_work[0] + (size_t) d * layout->state_aligned / sizeof(float);
++    }
+ 
+     const struct fastdiv_values * fd_H   = &kparams->div_H;
+     const struct fastdiv_values * fd_q1  = &kparams->div_q1;
+@@ -930,17 +1002,22 @@ static void gated_delta_net_f32_tg_thread(const htp_thread_t * th, unsigned int
      const struct fastdiv_values * fd_rq3 = &kparams->div_rq3;
      const struct fastdiv_values * fd_rk3 = &kparams->div_rk3;
  
@@ -612,8 +664,12 @@ index 0280f99a4..05e25e0bf 100644
      const dma_addr_t state_out_dma_base = dst_cache ? dst_cache->data : (dst->data + S_v * H * n_seqs * sizeof(float));
  
      uint32_t ir_prefetch = gctx->row_start + ith;
-@@ -940,7 +1010,7 @@ static void gated_delta_net_f32_tg_thread(const htp_thread_t * th, unsigned int
-     for (int step = 0; step < 2 && ir_prefetch < row_end; step++) {
+     int spad_idx = 0;
+ 
+-    // Prefetch preamble (up to 2 steps)
+-    for (int step = 0; step < 2 && ir_prefetch < row_end; step++) {
++    // Prefetch preamble (up to `depth` steps)
++    for (uint32_t step = 0; step < depth && ir_prefetch < row_end; step++) {
          const uint32_t piv1 = fastmodulo(ir_prefetch, H, fd_H);
          const uint32_t piv3 = fastdiv(ir_prefetch, fd_H);
 -        dma_addr_t ps_in  = state->data + ((uint64_t) piv3 * state_seq_stride + (uint64_t) piv1 * S_v * S_v) * sizeof(float);
@@ -621,7 +677,16 @@ index 0280f99a4..05e25e0bf 100644
          dma_addr_t ps_out = state_out_dma_base + ((uint64_t) piv3 * H + piv1) * S_v * S_v * sizeof(float);
  
          // Push dummy write-back
-@@ -983,9 +1053,9 @@ static void gated_delta_net_f32_tg_thread(const htp_thread_t * th, unsigned int
+@@ -954,7 +1031,7 @@ static void gated_delta_net_f32_tg_thread(const htp_thread_t * th, unsigned int
+                        S_v * sizeof(float), S_v);
+ 
+         ir_prefetch += nth;
+-        spad_idx ^= 1;
++        spad_idx = (spad_idx + 1 == (int) depth) ? 0 : spad_idx + 1;
+     }
+ 
+     struct htp_thread_trace * tr = th->trace;
+@@ -983,9 +1060,9 @@ static void gated_delta_net_f32_tg_thread(const htp_thread_t * th, unsigned int
                  (uint64_t) ik3 * k->nb[3] + (uint64_t) ik1 * k->nb[1]);
          const float * v_t = (const float *) ((const uint8_t *) (uintptr_t) v->data +
                  (uint64_t) iv3 * v->nb[3] + (uint64_t) iv1 * v->nb[1]);
@@ -633,7 +698,7 @@ index 0280f99a4..05e25e0bf 100644
                  (uint64_t) iv3 * beta->nb[3] + (uint64_t) iv1 * beta->nb[1]);
  
          htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) ir);
-@@ -1005,7 +1075,7 @@ static void gated_delta_net_f32_tg_thread(const htp_thread_t * th, unsigned int
+@@ -1005,17 +1082,17 @@ static void gated_delta_net_f32_tg_thread(const htp_thread_t * th, unsigned int
          if (ir_prefetch < row_end) {
              const uint32_t piv1 = fastmodulo(ir_prefetch, H, fd_H);
              const uint32_t piv3 = fastdiv(ir_prefetch, fd_H);
@@ -642,11 +707,32 @@ index 0280f99a4..05e25e0bf 100644
  
              dma_queue_push(dma_q, dma_make_data(s_work[spad_idx], ps_in),
                             S_v * sizeof(float), S_v * sizeof(float),
+                            S_v * sizeof(float), S_v);
+ 
+             ir_prefetch += nth;
+-            spad_idx ^= 1;
++            spad_idx = (spad_idx + 1 == (int) depth) ? 0 : spad_idx + 1;
+         }
+ 
+-        curr_spad_idx ^= 1;
++        curr_spad_idx = (curr_spad_idx + 1 == (int) depth) ? 0 : curr_spad_idx + 1;
+     }
+     dma_queue_flush(dma_q);
+ }
+@@ -2329,7 +2406,7 @@ int op_gated_delta_net(struct htp_ops_context * octx) {
+     gctx.row_start = row_start;
+     gctx.nrows     = nrows;
+ 
+-    htp_gdn_vtcm_layout_build(&gctx.layout, S_v, n_hvx);
++    htp_gdn_vtcm_layout_build(&gctx.layout, S_v, n_hvx, kparams->prefetch_depth);
+     gctx.vtcm_base = VTCM_LAYOUT_PTR(uint8_t, octx->ctx->vtcm_base, gctx.layout.off_state);
+ 
+     if (gctx.layout.total_bytes > octx->ctx->vtcm_size) {
 diff --git a/ggml/src/ggml-hexagon/htp/gated-delta-net-ops.h b/ggml/src/ggml-hexagon/htp/gated-delta-net-ops.h
-index aff1eb645..88129cbab 100644
+index aff1eb645..6188f2a04 100644
 --- a/ggml/src/ggml-hexagon/htp/gated-delta-net-ops.h
 +++ b/ggml/src/ggml-hexagon/htp/gated-delta-net-ops.h
-@@ -13,6 +13,12 @@
+@@ -13,6 +13,13 @@
  #define HTP_GDN_CHUNK_SIZE 64
  #define HTP_GDN_MIN_TOKENS 8
  
@@ -655,18 +741,36 @@ index aff1eb645..88129cbab 100644
 +//  GATES:        src[3] = alpha, src[4] = beta_raw, src[7] = dt_bias, src[8] = A; g/beta are computed in-kernel
 +#define HTP_GDN_FLAG_STATE_DIRECT 1u
 +#define HTP_GDN_FLAG_GATES        2u
++#define HTP_GDN_MAX_DEPTH         8u
 +
  #ifndef HMX_FP16_TILE_SIZE
  #define HMX_FP16_TILE_SIZE 2048
  #endif
-@@ -43,6 +49,7 @@ struct htp_gdn_kernel_params {
+@@ -43,6 +50,8 @@ struct htp_gdn_kernel_params {
      uint32_t state_size_per_snap;
  
      float    scale;
 +    uint32_t flags;              // HTP_GDN_FLAG_* (decode folds, see gated-delta-net-ops.c)
++    uint32_t prefetch_depth;     // decode: state buffers per HVX thread in the DMA ring (GGML_HEXAGON_GDN_DEPTH, >= 2)
  
      struct fastdiv_values div_H;
      struct fastdiv_values div_q1;
+@@ -67,11 +76,13 @@ struct htp_gdn_vtcm_layout {
+ static inline void htp_gdn_vtcm_layout_build(
+     struct htp_gdn_vtcm_layout * L,
+     uint32_t S_v,
+-    uint32_t n_hvx
++    uint32_t n_hvx,
++    uint32_t depth
+ ) {
+     size_t state_bytes = (size_t) S_v * S_v * sizeof(float);
++    if (depth < 2) depth = 2;
+     L->state_aligned = hex_round_up(state_bytes, 128);
+-    L->bytes_per_hvx = 2 * L->state_aligned;
++    L->bytes_per_hvx = (size_t) depth * L->state_aligned;
+     size_t off = 0;
+     VTCM_LAYOUT_ALLOC(off, off_state, L->bytes_per_hvx * n_hvx);
+     L->total_bytes = off;
 diff --git a/ggml/src/ggml-hexagon/htp/htp-ctx.h b/ggml/src/ggml-hexagon/htp/htp-ctx.h
 index 721fa2162..2e47ac3ff 100644
 --- a/ggml/src/ggml-hexagon/htp/htp-ctx.h
