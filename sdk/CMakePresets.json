@@ -64,6 +64,7 @@
         "strategy": "external"
       },
       "cacheVariables": {
+        "GGML_CPU_KLEIDIAI": "ON",
         "CMAKE_TOOLCHAIN_FILE": "${sourceDir}/cmake/arm64-windows-llvm.cmake",
         "PREBUILT_LIB_DIR": "windows_aarch64"
       }
