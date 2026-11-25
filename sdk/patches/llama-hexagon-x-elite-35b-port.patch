@@ -1,17 +1,18 @@
 diff --git a/ggml/src/ggml-hexagon/ggml-hexagon.cpp b/ggml/src/ggml-hexagon/ggml-hexagon.cpp
-index c38d0005c..442f9d9df 100644
+index c38d0005c..7dadf6a41 100644
 --- a/ggml/src/ggml-hexagon/ggml-hexagon.cpp
 +++ b/ggml/src/ggml-hexagon/ggml-hexagon.cpp
-@@ -137,6 +137,8 @@ int    opt_fa_select     = 2; // 2 = HMX -> HVX -> CPU, 1 = HVX -> CPU, 0 = CPU
+@@ -137,6 +137,9 @@ int    opt_fa_select     = 2; // 2 = HMX -> HVX -> CPU, 1 = HVX -> CPU, 0 = CPU
  int    opt_fa_split      = 1; // 1 = head-split + team-split when n_kv_heads < N_cores (default), 0 = off
  int    opt_li_select     = 2; // 2 = HMX -> HVX, 1 = HVX, 0 = CPU (unsupported)
  int    opt_gdn_select    = 2; // 2 = HMX -> HVX, 1 = HVX, 0 = CPU (unsupported)
 +int    opt_gdn_fold      = 1; // decode-time GDN folds: 1 = state-direct + gates, 0 = off (GGML_HEXAGON_GDN_FOLD)
++size_t opt_batch_vmem    = 0; // cap on the buffer bytes of one op batch (GGML_HEXAGON_BATCH_VMEM, MiB); 0 = max_vmem
 +int    opt_conv_fold     = 1; // decode-time direct ssm-conv fold (CONCAT+CPY+SSM_CONV[+SILU]), 0 = off (GGML_HEXAGON_CONV_FOLD)
  int    opt_ar_select     = 2; // 2 = fused ALLREDUCE+ADD (default), 1 = unfused ALLREDUCE, 0 = fallback to CPY+FENCE
  int    opt_ar_scatter    = 1; // 1 = reduce-scatter the fused ALLREDUCE+ADD (default), 0 = full reduction
  
-@@ -166,6 +168,15 @@ static const char * status_to_str(uint32_t status) {
+@@ -166,6 +169,15 @@ static const char * status_to_str(uint32_t status) {
              return "VTCM-TOO-SMALL";
          case HTP_STATUS_INTERNAL_ERR:
              return "INTERNAL-ERROR";
@@ -27,7 +28,16 @@ index c38d0005c..442f9d9df 100644
          default:
              return "UNKNOWN";
      }
-@@ -2440,6 +2451,332 @@ static void ggml_hexagon_graph_repack(const ggml_cgraph * graph, ggml_hexagon_se
+@@ -1234,7 +1246,7 @@ struct ggml_hexagon_opbatch {
+         n_ops_max  = batch_size;
+         n_tens_max = std::min<size_t>(n_ops_max * 4 + HTP_OP_MAX_INPUTS + HTP_OP_MAX_OUTPUTS, HTP_OP_MAX_TENSORS);
+ 
+-        b_vmem_max = max_vmem;
++        b_vmem_max = (opt_batch_vmem && opt_batch_vmem < max_vmem) ? opt_batch_vmem : max_vmem;
+ 
+         ops.resize(n_ops_max);
+ 
+@@ -2440,6 +2452,332 @@ static void ggml_hexagon_graph_repack(const ggml_cgraph * graph, ggml_hexagon_se
      }
  }
  
@@ -360,7 +370,7 @@ index c38d0005c..442f9d9df 100644
  static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, ggml_cgraph * graph) {
      auto sess = static_cast<ggml_hexagon_session *>(backend->context);
  
-@@ -2462,9 +2799,15 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
+@@ -2462,9 +2800,15 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
  
          computed_nodes.reserve(graph->n_nodes);
  
@@ -377,7 +387,7 @@ index c38d0005c..442f9d9df 100644
                  continue;
              }
  
-@@ -2476,6 +2819,25 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
+@@ -2476,6 +2820,25 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
              htp_opnode node(opcode, n);
              GGML_ASSERT(htp_kparams_solve(sess, node));
  
@@ -403,34 +413,37 @@ index c38d0005c..442f9d9df 100644
              computed_nodes.push_back(std::move(node));
          }
  
-@@ -3468,6 +3830,8 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
+@@ -3468,6 +3831,9 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
      const char * str_fa_split  = getenv("GGML_HEXAGON_FA_SPLIT");
      const char * str_li_select = getenv("GGML_HEXAGON_LI_SELECT");
      const char * str_gdn_select = getenv("GGML_HEXAGON_GDN_SELECT");
 +    const char * str_gdn_fold = getenv("GGML_HEXAGON_GDN_FOLD");
 +    const char * str_conv_fold = getenv("GGML_HEXAGON_CONV_FOLD");
++    const char * str_batch_vmem = getenv("GGML_HEXAGON_BATCH_VMEM");
      const char * str_ar_select = getenv("GGML_HEXAGON_AR_SELECT");
      const char * str_ar_scatter = getenv("GGML_HEXAGON_AR_SCATTER");
      const char * str_ndev     = getenv("GGML_HEXAGON_NDEV");
-@@ -3535,6 +3899,8 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
+@@ -3535,6 +3901,9 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
      opt_fa_split  = str_fa_split  ? atoi(str_fa_split)                   : opt_fa_split;
      opt_li_select = str_li_select ? atoi(str_li_select)                   : opt_li_select;
      opt_gdn_select    = str_gdn_select    ? atoi(str_gdn_select)          : opt_gdn_select;
 +    opt_gdn_fold      = str_gdn_fold      ? atoi(str_gdn_fold)            : opt_gdn_fold;
 +    opt_conv_fold     = str_conv_fold     ? atoi(str_conv_fold)           : opt_conv_fold;
++    opt_batch_vmem    = str_batch_vmem    ? strtoul(str_batch_vmem, NULL, 0) * 1024u * 1024u : opt_batch_vmem;
      opt_ar_select     = str_ar_select     ? atoi(str_ar_select)           : opt_ar_select;
      opt_ar_scatter    = str_ar_scatter    ? atoi(str_ar_scatter)          : opt_ar_scatter;
  
 diff --git a/ggml/src/ggml-hexagon/htp-common.h b/ggml/src/ggml-hexagon/htp-common.h
-index 4e9e54415..8f63c9116 100644
+index 4e9e54415..8ce325c30 100644
 --- a/ggml/src/ggml-hexagon/htp-common.h
 +++ b/ggml/src/ggml-hexagon/htp-common.h
-@@ -25,6 +25,8 @@ extern int    opt_fa_select;
+@@ -25,6 +25,9 @@ extern int    opt_fa_select;
  extern int    opt_fa_split;
  extern int    opt_li_select;
  extern int    opt_gdn_select;
 +extern int    opt_gdn_fold;
 +extern int    opt_conv_fold;
++extern size_t opt_batch_vmem;
  extern int    opt_ar_select;
  extern int    opt_ar_scatter;
  
@@ -617,6 +630,20 @@ index aff1eb645..88129cbab 100644
  
      struct fastdiv_values div_H;
      struct fastdiv_values div_q1;
+diff --git a/ggml/src/ggml-hexagon/htp/htp-ctx.h b/ggml/src/ggml-hexagon/htp/htp-ctx.h
+index 721fa2162..2e47ac3ff 100644
+--- a/ggml/src/ggml-hexagon/htp/htp-ctx.h
++++ b/ggml/src/ggml-hexagon/htp/htp-ctx.h
+@@ -106,6 +106,9 @@ struct htp_context {
+     atomic_bool            vtcm_needs_release;
+ 
+     uint64_t               max_vmem;
++    uint32_t               mmap_inuse;         // x-elite port (cand. A): mappings used by the batch being computed
++    void *                 prep_stack;         // stack of the prep helper thread (pipelined prep_op_bufs)
++    uint32_t               prep_stack_size;
+     struct htp_dirty_range dirty_ranges[HTP_MAX_DIRTY_RANGES];
+ 
+     // Persistent DDR scratchpad for MUL_MAT_ID mappings
 diff --git a/ggml/src/ggml-hexagon/htp/htp-ops.h b/ggml/src/ggml-hexagon/htp/htp-ops.h
 index 7c4b97307..b7f40a729 100644
 --- a/ggml/src/ggml-hexagon/htp/htp-ops.h
@@ -638,6 +665,251 @@ index 7c4b97307..b7f40a729 100644
  };
  
  // First set of values must match the ggml_type.
+diff --git a/ggml/src/ggml-hexagon/htp/main.c b/ggml/src/ggml-hexagon/htp/main.c
+index ad457d1a6..04bddf710 100644
+--- a/ggml/src/ggml-hexagon/htp/main.c
++++ b/ggml/src/ggml-hexagon/htp/main.c
+@@ -707,6 +707,9 @@ AEEResult htp_iface_start(remote_handle64 handle, uint32_t sess_id, uint64_t dsp
+         qurt_thread_attr_set_stack_size(&attr, size_main_stack);
+         qurt_thread_attr_set_priority(&attr, main_prio);
+         qurt_thread_attr_set_name(&attr, "htp-main");
++        ctx->prep_stack_size = PREP_THREAD_STACK_SIZE;
++        ctx->prep_stack      = malloc(ctx->prep_stack_size);
++        if (!ctx->prep_stack) { ctx->prep_stack_size = 0; }
+ 
+         int err_thread = qurt_thread_create(&ctx->main_thread, &attr, htp_main_thread, ctx);
+         if (err_thread) {
+@@ -733,6 +736,7 @@ AEEResult htp_iface_stop(remote_handle64 handle) {
+         atomic_store(&ctx->killed, true);
+         int status;
+         (void) qurt_thread_join(ctx->main_thread, &status);
++        if (ctx->prep_stack) { free(ctx->prep_stack); ctx->prep_stack = NULL; ctx->prep_stack_size = 0; }
+         ctx->main_thread = 0;
+     }
+ 
+@@ -1141,7 +1145,43 @@ static inline bool mmap_buf(struct htp_context *ctx, struct htp_buf_desc *b) {
+     return false;
+ }
+ 
+-static void prep_op_bufs(struct htp_context *ctx, struct htp_buf_desc *bufs, uint32_t n_bufs) {
++// Mask of the mappings the given buffers resolve to (after a successful prep).
++static uint32_t bufs_mmap_mask(struct htp_context *ctx, const struct htp_buf_desc *bufs, uint32_t n_bufs) {
++    uint32_t mask = 0;
++    for (uint32_t i = 0; i < n_bufs; i++) {
++        for (uint32_t m = 0; m < HTP_MAX_MMAPS; m++) {
++            if (ctx->mmap[m].size && ctx->mmap[m].fd == bufs[i].fd && ctx->mmap[m].flags == bufs[i].flags) {
++                mask |= (1u << m);
++                break;
++            }
++        }
++    }
++    return mask;
++}
++
++// Can the buffers of a queued batch be mapped next to the `protect`ed (running) mappings without dropping them?
++static bool prep_op_bufs_fit(struct htp_context *ctx, const struct htp_buf_desc *bufs, uint32_t n_bufs, uint32_t protect) {
++    uint64_t need = 0;
++    for (uint32_t i = 0; i < n_bufs; i++) {
++        const struct htp_buf_desc *b = bufs + i;
++        if (b->flags & HTP_BUF_EXTENDED) continue;
++        bool have = false;
++        for (uint32_t m = 0; m < HTP_MAX_MMAPS; m++) {
++            if (ctx->mmap[m].size && ctx->mmap[m].fd == b->fd && ctx->mmap[m].flags == b->flags) { have = true; break; }
++        }
++        if (!have) need += b->size;
++    }
++    uint64_t kept = 0;
++    for (uint32_t m = 0; m < HTP_MAX_MMAPS; m++) {
++        if ((protect & (1u << m)) && !(ctx->mmap[m].flags & HTP_BUF_EXTENDED)) kept += ctx->mmap[m].size;
++    }
++    return (kept + need) <= ctx->max_vmem;
++}
++
++// protect: mappings that must not be dropped (the batch currently computing, when prep runs ahead of it).
++// Returns false only when protect != 0 and the buffers could not be mapped; the caller then retries after the
++// running batch with protect == 0 (which may defragment).
++static bool prep_op_bufs(struct htp_context *ctx, struct htp_buf_desc *bufs, uint32_t n_bufs, uint32_t protect) {
+     uint32_t m_reuse = 0; // mmap reuse mask (index from ctx->mmap array)
+     uint32_t b_reuse = 0; // buf reuse count
+ 
+@@ -1159,7 +1199,7 @@ static void prep_op_bufs(struct htp_context *ctx, struct htp_buf_desc *bufs, uin
+         FARF(HIGH, "prep-buf #%u : pass0 fd %u base 0x%llx size %llu flags 0x%x", i, b->fd, (unsigned long long) b->base, (unsigned long long) b->size, b->flags);
+     }
+ 
+-    if (b_reuse == n_bufs) return; // all bufs reuse existing mappings
++    if (b_reuse == n_bufs) return true; // all bufs reuse existing mappings
+ 
+     // See how much vmem we have mmaped right now
+     for (uint32_t i=0; i<HTP_MAX_MMAPS; i++) {
+@@ -1174,7 +1214,7 @@ static void prep_op_bufs(struct htp_context *ctx, struct htp_buf_desc *bufs, uin
+     if ((m_vmem + e_vmem) > ctx->max_vmem) {
+         // Drop unused mappings
+         for (uint32_t i=0; i < HTP_MAX_MMAPS; i++) {
+-            bool used = m_reuse & (1<<i);
++            bool used = (m_reuse | protect) & (1u<<i);
+             if (!used && !(ctx->mmap[i].flags & HTP_BUF_EXTENDED)) {
+                 drop_mmap(ctx, ctx->mmap + i);
+             }
+@@ -1192,6 +1232,11 @@ static void prep_op_bufs(struct htp_context *ctx, struct htp_buf_desc *bufs, uin
+         FARF(HIGH, "prep-buf #%u : pass1 fd %u base 0x%llx size %llu flags 0x%x", i, b->fd, (unsigned long long) b->base, (unsigned long long) b->size, b->flags);
+     }
+ 
++    if (!mmap_ok && protect) {
++        FARF(HIGH, "prep-bufs : pipelined prep could not map next to the running batch, deferring");
++        return false;
++    }
++
+     if (!mmap_ok) {
+         // Attempt defragmentation: drop 32-bit mappings and remap (pass 2)
+         FARF(HIGH, "prep-bufs : dropping 32-bit mappings to defragment address space");
+@@ -1213,6 +1258,7 @@ static void prep_op_bufs(struct htp_context *ctx, struct htp_buf_desc *bufs, uin
+             FARF(HIGH, "prep-buf #%u : pass2 fd %u base 0x%llx size %llu flags 0x%x", i, b->fd, (unsigned long long) b->base, (unsigned long long) b->size, b->flags);
+         }
+     }
++    return true;
+ }
+ 
+ static void prep_tensor(struct htp_context *ctx, struct htp_buf_desc *bufs, struct htp_tensor *tens, uint32_t idx, struct htp_tensor *t) {
+@@ -1342,7 +1388,8 @@ static void process_opbatch(struct htp_context * ctx, const struct htp_opbatch_r
+     htp_trace_event_stop(&ctx->trace[0], HTP_TRACE_EVT_L2FLUSH, 0);
+ 
+     htp_trace_event_start(&ctx->trace[0], HTP_TRACE_EVT_BUFF, 0);
+-    prep_op_bufs(ctx, bufs, n_bufs);
++    (void) prep_op_bufs(ctx, bufs, n_bufs, 0);
++    ctx->mmap_inuse = bufs_mmap_mask(ctx, bufs, n_bufs);
+     htp_trace_event_stop(&ctx->trace[0], HTP_TRACE_EVT_BUFF, 0);
+ 
+     prep_tensors(ctx, bufs, tens, n_tens);
+@@ -1426,6 +1473,25 @@ static void process_opbatch(struct htp_context * ctx, const struct htp_opbatch_r
+ #define DSPQUEUE_POLL_TIMEOUT_USEC 100
+ #define DSPQUEUE_POLL_COUNT        100
+ 
++// x-elite port (candidate A): while a batch computes, map the buffers of the next queued batch on a helper
++// thread, so the per-batch mmap churn (the 32-bit VA budget cannot hold the 20 GB model) overlaps compute.
++// Only done when the next batch fits next to the running one (host: GGML_HEXAGON_BATCH_VMEM caps batches).
++struct htp_prep_job {
++    struct htp_context *  ctx;
++    struct htp_buf_desc * bufs;
++    uint32_t              n_bufs;
++    uint32_t              protect;
++    volatile int          done;    // 1 = mapped, -1 = deferred
++};
++
++static void prep_thread_fn(void * arg) {
++    struct htp_prep_job * job = (struct htp_prep_job *) arg;
++    job->done = prep_op_bufs(job->ctx, job->bufs, job->n_bufs, job->protect) ? 1 : -1;
++    qurt_thread_exit(0);
++}
++
++#define PREP_THREAD_STACK_SIZE (64 * 1024)
++
+ static void process_ops(struct htp_context * ctx) {
+     dspqueue_t queue = ctx->dsp_queue;
+     int err;
+@@ -1434,37 +1500,84 @@ static void process_ops(struct htp_context * ctx) {
+ 
+     vtcm_acquire(ctx);
+ 
+-    while (!atomic_load(&ctx->vtcm_needs_release) && !atomic_load(&ctx->killed)) {
+-        struct htp_opbatch_req req;
+-        uint32_t r_size = sizeof(req);
++    struct htp_opbatch_req  next_req;
++    struct dspqueue_buffer  next_dbuf;
++    bool                    have_next = false;
+ 
++    while (have_next || (!atomic_load(&ctx->vtcm_needs_release) && !atomic_load(&ctx->killed))) {
++        struct htp_opbatch_req req;
+         struct dspqueue_buffer dbuf;
+-        uint32_t n_dbufs = 1;
+-        uint32_t flags   = 0;
+ 
+-        err = dspqueue_read_noblock(queue, &flags, n_dbufs, &n_dbufs, &dbuf, r_size, &r_size, (uint8_t *) &req);
+-        if (err == AEE_EWOULDBLOCK) {
+-            if (--poll_count) {
+-                qurt_sleep(DSPQUEUE_POLL_TIMEOUT_USEC);
++        if (have_next) {
++            req  = next_req;
++            dbuf = next_dbuf;
++            have_next = false;
++        } else {
++            uint32_t r_size = sizeof(req);
++            uint32_t n_dbufs = 1;
++            uint32_t flags   = 0;
++            err = dspqueue_read_noblock(queue, &flags, n_dbufs, &n_dbufs, &dbuf, r_size, &r_size, (uint8_t *) &req);
++            if (err == AEE_EWOULDBLOCK) {
++                if (--poll_count) {
++                    qurt_sleep(DSPQUEUE_POLL_TIMEOUT_USEC);
++                    continue;
++                }
++                break;
++            }
++            if (err != 0) {
++                FARF(ERROR, "dspqueue_read_noblock failed: 0x%08x", (unsigned) err);
++                break;
++            }
++            if (r_size < sizeof(req) || n_dbufs != 1) {
++                FARF(ERROR, "invalid request : size %u n-dbufs %u", r_size, n_dbufs);
+                 continue;
+             }
+-            break;
+         }
++        // Reset poll count for valid requests
++        poll_count = DSPQUEUE_POLL_COUNT;
+ 
+-        if (err != 0) {
+-            FARF(ERROR, "dspqueue_read_noblock failed: 0x%08x", (unsigned) err);
+-            break;
++        // Map this batch now (fast when the previous iteration prepared it), then look for the next one.
++        {
++            struct htp_buf_desc * bufs = (struct htp_buf_desc *) dbuf.ptr;
++            (void) prep_op_bufs(ctx, bufs, req.n_bufs, 0);
++            ctx->mmap_inuse = bufs_mmap_mask(ctx, bufs, req.n_bufs);
+         }
+ 
+-        if (r_size < sizeof(req) || n_dbufs != 1) {
+-            FARF(ERROR, "invalid request : size %u n-dbufs %u", r_size, n_dbufs);
+-            continue;
++        struct htp_prep_job job;
++        qurt_thread_t       prep_tid = 0;
++        bool                prep_running = false;
++        {
++            uint32_t r_size = sizeof(next_req);
++            uint32_t n_dbufs = 1;
++            uint32_t flags   = 0;
++            err = dspqueue_read_noblock(queue, &flags, n_dbufs, &n_dbufs, &next_dbuf, r_size, &r_size, (uint8_t *) &next_req);
++            if (err == 0 && r_size >= sizeof(next_req) && n_dbufs == 1) {
++                have_next = true;
++                struct htp_buf_desc * nbufs = (struct htp_buf_desc *) next_dbuf.ptr;
++                if (ctx->prep_stack && prep_op_bufs_fit(ctx, nbufs, next_req.n_bufs, ctx->mmap_inuse)) {
++                    job.ctx = ctx; job.bufs = nbufs; job.n_bufs = next_req.n_bufs; job.protect = ctx->mmap_inuse; job.done = 0;
++                    qurt_thread_attr_t attr;
++                    qurt_thread_attr_init(&attr);
++                    qurt_thread_attr_set_stack_addr(&attr, ctx->prep_stack);
++                    qurt_thread_attr_set_stack_size(&attr, ctx->prep_stack_size);
++                    qurt_thread_attr_set_priority(&attr, ctx->thread_prio + 20);
++                    qurt_thread_attr_set_name(&attr, "htp-prep");
++                    if (qurt_thread_create(&prep_tid, &attr, prep_thread_fn, &job) == 0) {
++                        prep_running = true;
++                    }
++                }
++            } else if (err == 0) {
++                FARF(ERROR, "invalid request : size %u n-dbufs %u", r_size, n_dbufs);
++            }
+         }
+ 
+-        // Reset poll count for valid requests
+-        poll_count = DSPQUEUE_POLL_COUNT;
+-
+         process_opbatch(ctx, &req, &dbuf);
++
++        if (prep_running) {
++            int status = 0;
++            (void) qurt_thread_join(prep_tid, &status);
++            // job.done == -1: the next batch maps itself at the top of the loop (protect == 0)
++        }
+     }
+ 
+     vtcm_release(ctx);
 diff --git a/ggml/src/ggml-hexagon/htp/matmul-ops.c b/ggml/src/ggml-hexagon/htp/matmul-ops.c
 index fb15310cf..e7d57f7a1 100644
 --- a/ggml/src/ggml-hexagon/htp/matmul-ops.c
