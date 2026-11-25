@@ -615,6 +615,69 @@ index 2fbd419ac..e9e130650 100644
              kparams->n_weights         = n_weights;
          } else {
              kparams->kernel_type = HTP_MM_KERNEL_UNSUPPORTED;
+diff --git a/ggml/src/ggml-hexagon/htp-repack.cpp b/ggml/src/ggml-hexagon/htp-repack.cpp
+index d2e3df2cf..04b391e91 100644
+--- a/ggml/src/ggml-hexagon/htp-repack.cpp
++++ b/ggml/src/ggml-hexagon/htp-repack.cpp
+@@ -48,6 +48,31 @@ static inline void transpose_tile_to_nibbles(uint8_t tile_quants[32][32], const
+     }
+ }
+ 
++
++// x-elite port B3: q4_0 tile nibble layout. Vector i (bytes 128i..128i+127), byte[4*row + j] = k 8i+j (low nibble)
++// | k 8i+4+j (high nibble), so the DSP kernels unpack with a mask and a shift instead of a byte transpose.
++static inline void transpose_nibbles_to_tile_q4v2(uint8_t * tile_dst, const uint8_t tile_quants[32][32]) {
++    for (int i = 0; i < 4; i++) {
++        for (int row = 0; row < 32; row++) {
++            for (int j = 0; j < 4; j++) {
++                tile_dst[i * 128 + row * 4 + j] = (uint8_t) (tile_quants[row][8 * i + j] | (tile_quants[row][8 * i + 4 + j] << 4));
++            }
++        }
++    }
++}
++
++static inline void transpose_tile_to_nibbles_q4v2(uint8_t tile_quants[32][32], const uint8_t * tile_src) {
++    for (int i = 0; i < 4; i++) {
++        for (int row = 0; row < 32; row++) {
++            for (int j = 0; j < 4; j++) {
++                const uint8_t val = tile_src[i * 128 + row * 4 + j];
++                tile_quants[row][8 * i + j]     = val & 0x0F;
++                tile_quants[row][8 * i + 4 + j] = val >> 4;
++            }
++        }
++    }
++}
++
+ #if defined(__ARM_NEON) || defined(__aarch64__)
+ static void repack_neon_transpose8x8(const uint8x8_t rows[8], uint8x8_t columns[8]) {
+     const uint8x8x2_t t0 = vtrn_u8(rows[0], rows[1]);
+@@ -440,7 +465,7 @@ static void repack_q4_0_tiled(ggml_tensor * t, const void * data, size_t offset,
+         [](uint8_t * tile_dst, const block_q4_0 * src_slice, int64_t ne0, int64_t ne1, int64_t row_stride, int ct, int kt) {
+             ggml_half * scale_dst = (ggml_half *) (tile_dst + 512);
+ #if defined(__ARM_NEON) || defined(__aarch64__)
+-            if (ct * 32 + 32 <= ne1 && kt < ne0 / 32) {
++            if (false && ct * 32 + 32 <= ne1 && kt < ne0 / 32) {   // B3: NEON path writes the old layout
+                 for (int row0 = 0; row0 < 32; row0 += 8) {
+                     const uint8_t * qs[8];
+                     for (int rr = 0; rr < 8; ++rr) {
+@@ -467,7 +492,7 @@ static void repack_q4_0_tiled(ggml_tensor * t, const void * data, size_t offset,
+                     scale_dst[row] = 0;
+                 }
+             }
+-            transpose_nibbles_to_tile(tile_dst, tile_quants);
++            transpose_nibbles_to_tile_q4v2(tile_dst, tile_quants);
+         });
+ }
+ 
+@@ -475,7 +500,7 @@ static void repack_tiled_q4_0(void * data, const ggml_tensor * t, size_t offset,
+     unpack_from_tiled_grid_32<block_q4_0, 1>(data, t, offset, size, HTP_TENSOR_TILE_SIZE_Q4_0,
+         [](block_q4_0 * dst_slice, const uint8_t * tile_src, int64_t ne0, int64_t start_row, int64_t end_row, int64_t row_stride, int ct, int kt) {
+             uint8_t tile_quants[32][32];
+-            transpose_tile_to_nibbles(tile_quants, tile_src);
++            transpose_tile_to_nibbles_q4v2(tile_quants, tile_src);
+             const ggml_half * scale_src = (const ggml_half *) (tile_src + 512);
+             for (int row = 0; row < 32; row++) {
+                 const int64_t r = ct * 32 + row;
 diff --git a/ggml/src/ggml-hexagon/htp/gated-delta-net-ops.c b/ggml/src/ggml-hexagon/htp/gated-delta-net-ops.c
 index 0280f99a4..51cee910c 100644
 --- a/ggml/src/ggml-hexagon/htp/gated-delta-net-ops.c
@@ -876,6 +939,46 @@ index aff1eb645..97529f235 100644
      size_t off = 0;
      VTCM_LAYOUT_ALLOC(off, off_state, L->bytes_per_hvx * n_hvx);
      L->total_bytes = off;
+diff --git a/ggml/src/ggml-hexagon/htp/hmx-mm-kernels-tiled.h b/ggml/src/ggml-hexagon/htp/hmx-mm-kernels-tiled.h
+index 590167492..b2148d704 100644
+--- a/ggml/src/ggml-hexagon/htp/hmx-mm-kernels-tiled.h
++++ b/ggml/src/ggml-hexagon/htp/hmx-mm-kernels-tiled.h
+@@ -110,21 +110,20 @@ static void dequantize_tiled_weight_to_fp16_task_q4_0(
+         v_lo3 = Q6_Vb_vsub_VbVb(v_lo3, i8);
+         v_hi3 = Q6_Vb_vsub_VbVb(v_hi3, i8);
+ 
+-        // Shuffling
+-        HVX_VectorPair vp_shuf0 = Q6_W_vshuff_VVR(v_hi0, v_lo0, -1);
+-        HVX_VectorPair vp_shuf1 = Q6_W_vshuff_VVR(v_hi1, v_lo1, -1);
+-        HVX_VectorPair vp_shuf2 = Q6_W_vshuff_VVR(v_hi2, v_lo2, -1);
+-        HVX_VectorPair vp_shuf3 = Q6_W_vshuff_VVR(v_hi3, v_lo3, -1);
+-
+-        // Unpack to 16-bit
+-        HVX_VectorPair vp_int16_lo0 = Q6_Wh_vunpack_Vb(Q6_V_lo_W(vp_shuf0));
+-        HVX_VectorPair vp_int16_hi0 = Q6_Wh_vunpack_Vb(Q6_V_hi_W(vp_shuf0));
+-        HVX_VectorPair vp_int16_lo1 = Q6_Wh_vunpack_Vb(Q6_V_lo_W(vp_shuf1));
+-        HVX_VectorPair vp_int16_hi1 = Q6_Wh_vunpack_Vb(Q6_V_hi_W(vp_shuf1));
+-        HVX_VectorPair vp_int16_lo2 = Q6_Wh_vunpack_Vb(Q6_V_lo_W(vp_shuf2));
+-        HVX_VectorPair vp_int16_hi2 = Q6_Wh_vunpack_Vb(Q6_V_hi_W(vp_shuf2));
+-        HVX_VectorPair vp_int16_lo3 = Q6_Wh_vunpack_Vb(Q6_V_lo_W(vp_shuf3));
+-        HVX_VectorPair vp_int16_hi3 = Q6_Wh_vunpack_Vb(Q6_V_hi_W(vp_shuf3));
++        // x-elite port B3 layout: byte[4*row + j] of group g holds k = 8g+j (low nibble) / 8g+4+j (high nibble).
++        // Output column pair cp (k = 2cp, 2cp+1 of the group) is the even (cp 0, 2) or odd (cp 1, 3) halfword of each
++        // 4-byte row lane of v_lo (cp 0, 1) / v_hi (cp 2, 3): [even | odd] halfwords then unpack to int16 gives
++        // the same (row-major, k-pair interleaved) order as the old byte shuffle.
++#define HTP_Q4V2_EO(v) Q6_V_valign_VVR(Q6_Vh_vpacko_VwVw(v, v), Q6_Vh_vpacke_VwVw(v, v), 64)
++        HVX_VectorPair vp_int16_lo0 = Q6_Wh_vunpack_Vb(HTP_Q4V2_EO(v_lo0));
++        HVX_VectorPair vp_int16_hi0 = Q6_Wh_vunpack_Vb(HTP_Q4V2_EO(v_hi0));
++        HVX_VectorPair vp_int16_lo1 = Q6_Wh_vunpack_Vb(HTP_Q4V2_EO(v_lo1));
++        HVX_VectorPair vp_int16_hi1 = Q6_Wh_vunpack_Vb(HTP_Q4V2_EO(v_hi1));
++        HVX_VectorPair vp_int16_lo2 = Q6_Wh_vunpack_Vb(HTP_Q4V2_EO(v_lo2));
++        HVX_VectorPair vp_int16_hi2 = Q6_Wh_vunpack_Vb(HTP_Q4V2_EO(v_hi2));
++        HVX_VectorPair vp_int16_lo3 = Q6_Wh_vunpack_Vb(HTP_Q4V2_EO(v_lo3));
++        HVX_VectorPair vp_int16_hi3 = Q6_Wh_vunpack_Vb(HTP_Q4V2_EO(v_hi3));
++#undef HTP_Q4V2_EO
+ 
+         // Convert and scale multiplication
+         HVX_Vector v_grp0_0 = Q6_Vhf_equals_Vqf16(Q6_Vqf16_vmpy_VhfVhf(Q6_Vhf_equals_Vh(Q6_V_lo_W(vp_int16_lo0)), v_scale_duplicated));
 diff --git a/ggml/src/ggml-hexagon/htp/htp-ctx.h b/ggml/src/ggml-hexagon/htp/htp-ctx.h
 index 721fa2162..2e47ac3ff 100644
 --- a/ggml/src/ggml-hexagon/htp/htp-ctx.h
@@ -911,6 +1014,104 @@ index 7c4b97307..b7f40a729 100644
  };
  
  // First set of values must match the ggml_type.
+diff --git a/ggml/src/ggml-hexagon/htp/hvx-mm-kernels-tiled.h b/ggml/src/ggml-hexagon/htp/hvx-mm-kernels-tiled.h
+index 01c671679..082a3fbd2 100644
+--- a/ggml/src/ggml-hexagon/htp/hvx-mm-kernels-tiled.h
++++ b/ggml/src/ggml-hexagon/htp/hvx-mm-kernels-tiled.h
+@@ -510,6 +510,55 @@ static inline HVX_VectorPair accum_4bit_32x2(
+     return Q6_W_vcombine_VV(v_sum1, v_sum0);
+ }
+ 
++
++// x-elite port B3: q4_0 tiles use the row-major nibble layout (see repack_q4_0_tiled): vector i, byte[4*row + j] holds
++// k = 8i+j in the low nibble and k = 8i+4+j in the high nibble, so W0 / W1 for vrmpy are a mask and a shift away
++// (no permute-unit ops). The integer dot over the 32-k tile is unchanged, so results are bit-identical to the old path.
++static inline HVX_Vector accum_q4v2_32x1(
++    const HVX_Vector * restrict vptr,
++    const HVX_Vector * restrict v_act,
++    HVX_Vector i8
++) {
++    HVX_Vector v_sum0 = Q6_V_vzero();
++    HVX_Vector v_sum1 = Q6_V_vzero();
++    HVX_Vector mask_h4 = Q6_Vb_vsplat_R(0x0F);
++
++    #pragma unroll
++    for (int i = 0; i < 4; i++) {
++        HVX_Vector v_W0 = Q6_Vb_vsub_VbVb(Q6_V_vand_VV(vptr[i], mask_h4), i8);
++        HVX_Vector v_W1 = Q6_Vb_vsub_VbVb(Q6_Vub_vlsr_VubR(vptr[i], 4), i8);
++        v_sum0 = Q6_Vw_vrmpyacc_VwVbVb(v_sum0, v_W0, v_act[i * 2 + 0]);
++        v_sum1 = Q6_Vw_vrmpyacc_VwVbVb(v_sum1, v_W1, v_act[i * 2 + 1]);
++    }
++
++    return Q6_Vw_vadd_VwVw(v_sum0, v_sum1);
++}
++
++static inline HVX_VectorPair accum_q4v2_32x2(
++    const HVX_Vector * restrict vptr,
++    const HVX_Vector * restrict v_act0,
++    const HVX_Vector * restrict v_act1,
++    HVX_Vector i8
++) {
++    HVX_Vector v_sum0 = Q6_V_vzero();
++    HVX_Vector v_sum1 = Q6_V_vzero();
++    HVX_Vector mask_h4 = Q6_Vb_vsplat_R(0x0F);
++
++    #pragma unroll
++    for (int i = 0; i < 4; i++) {
++        HVX_Vector v_W0 = Q6_Vb_vsub_VbVb(Q6_V_vand_VV(vptr[i], mask_h4), i8);
++        HVX_Vector v_W1 = Q6_Vb_vsub_VbVb(Q6_Vub_vlsr_VubR(vptr[i], 4), i8);
++
++        v_sum0 = Q6_Vw_vrmpyacc_VwVbVb(v_sum0, v_W0, v_act0[i * 2 + 0]);
++        v_sum0 = Q6_Vw_vrmpyacc_VwVbVb(v_sum0, v_W1, v_act0[i * 2 + 1]);
++
++        v_sum1 = Q6_Vw_vrmpyacc_VwVbVb(v_sum1, v_W0, v_act1[i * 2 + 0]);
++        v_sum1 = Q6_Vw_vrmpyacc_VwVbVb(v_sum1, v_W1, v_act1[i * 2 + 1]);
++    }
++
++    return Q6_W_vcombine_VV(v_sum1, v_sum0);
++}
++
+ static inline HVX_VectorPair accum_4bit_32x2_lut(
+     const HVX_Vector * restrict vptr,
+     const HVX_Vector * restrict v_act0,
+@@ -1013,7 +1062,7 @@ static void tiled_vec_dot_q4_0_32x1(const uint32_t n, float * restrict s, const
+         const HVX_Vector * restrict vptr = (const HVX_Vector *) (tile_ptr + kt * 640);
+         const HVX_Vector * restrict v_act = (const HVX_Vector *) (y_q + kt * 1152);
+ 
+-        HVX_Vector v_sum = accum_4bit_32x1(vptr, v_act, i8);
++        HVX_Vector v_sum = accum_q4v2_32x1(vptr, v_act, i8);
+         HVX_Vector v_sum_sf = Q6_Vsf_equals_Vw(v_sum);
+ 
+         HVX_Vector v_scale_w = vptr[4];
+@@ -1046,7 +1095,7 @@ static void tiled_vec_dot_q4_0_32x2(const uint32_t n, float * restrict s0, float
+         const HVX_Vector * restrict v_act0 = (const HVX_Vector *) (y0_q + kt * 1152);
+         const HVX_Vector * restrict v_act1 = (const HVX_Vector *) (y1_q + kt * 1152);
+ 
+-        HVX_VectorPair v_sums = accum_4bit_32x2(vptr, v_act0, v_act1, i8);
++        HVX_VectorPair v_sums = accum_q4v2_32x2(vptr, v_act0, v_act1, i8);
+         HVX_Vector v_sum_c0 = Q6_V_lo_W(v_sums);
+         HVX_Vector v_sum_c1 = Q6_V_hi_W(v_sums);
+ 
+diff --git a/ggml/src/ggml-hexagon/htp/hvx-quant.h b/ggml/src/ggml-hexagon/htp/hvx-quant.h
+index b0ca6ecf6..cd62dddaa 100644
+--- a/ggml/src/ggml-hexagon/htp/hvx-quant.h
++++ b/ggml/src/ggml-hexagon/htp/hvx-quant.h
+@@ -519,12 +519,13 @@ static inline void hvx_dequantize_row_tiled_q4_0_f32(float * dst_spad, const uin
+ 
+         HVX_Vector vq = Q6_V_vzero();
+         for (int group = 3; group >= 0; --group) {
+-            vq = Q6_V_vmux_QVV(first4, hvx_dequantize_gather4(hvx_vmem(tile + group * VLEN), row), Q6_V_vror_VR(vq, VLEN - 4));
++            // B3 layout: the row's 4 bytes of this group are contiguous at byte 4*row
++            vq = Q6_V_vmux_QVV(first4, Q6_V_vror_VR(hvx_vmem(tile + group * VLEN), 4 * row), Q6_V_vror_VR(vq, VLEN - 4));
+         }
+ 
+         const HVX_Vector lo = Q6_V_vand_VV(vq, Q6_Vb_vsplat_R(0x0F));
+         const HVX_Vector hi = Q6_Vub_vlsr_VubR(vq, 4);
+-        vq = Q6_V_lo_W(Q6_W_vshuff_VVR(hi, lo, -1));
++        vq = Q6_V_lo_W(Q6_W_vshuff_VVR(hi, lo, -4));   // B3 layout: k 0..3 are the low nibbles, 4..7 the high ones
+         vq = Q6_Vb_vsub_VbVb(vq, Q6_Vb_vsplat_R(8));
+ 
+         const HVX_Vector scales = hvx_vmem(tile + 512);
 diff --git a/ggml/src/ggml-hexagon/htp/main.c b/ggml/src/ggml-hexagon/htp/main.c
 index ad457d1a6..d93645b35 100644
 --- a/ggml/src/ggml-hexagon/htp/main.c
