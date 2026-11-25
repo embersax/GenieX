@@ -1,5 +1,5 @@
 diff --git a/ggml/src/ggml-hexagon/ggml-hexagon.cpp b/ggml/src/ggml-hexagon/ggml-hexagon.cpp
-index c38d0005c..d5042ddef 100644
+index c38d0005c..442f9d9df 100644
 --- a/ggml/src/ggml-hexagon/ggml-hexagon.cpp
 +++ b/ggml/src/ggml-hexagon/ggml-hexagon.cpp
 @@ -137,6 +137,8 @@ int    opt_fa_select     = 2; // 2 = HMX -> HVX -> CPU, 1 = HVX -> CPU, 0 = CPU
@@ -255,7 +255,7 @@ index c38d0005c..d5042ddef 100644
 +        const ggml_tensor * x   = y->src[3];
 +        const int64_t C = y->ne[0];
 +        const int64_t T = y->ne[1];
-+        if (T != 1 || C <= 0 || (C % HTP_SSM_DIRECT_SLICE) != 0 || y->ne[2] != 1) continue;
++        if (T < 1 || T > HTP_SSM_DIRECT_MAX_T || C <= 0 || (C % HTP_SSM_DIRECT_SLICE) != 0 || y->ne[2] != 1) continue;
 +        if (!operand(y, C, T) || !operand(x, C, T) || !operand(old, 3, C) || !operand(w, 4, C) ||
 +            !operand(cat, T + 3, C) || cat->op != GGML_OP_CONCAT || cat->view_src ||
 +            ggml_get_op_params_i32(cat, 0) != 0 || cat->src[0] != old || cat->src[2]) continue;
@@ -450,6 +450,21 @@ index eb0862669..a70ca6ef3 100644
      if (!ggml_are_same_layout(conv_dst, dst)) return false;
      if (htp_tensors_overlap(dst, prev.src0()) || htp_tensors_overlap(dst, prev.src1())) return false;
  
+diff --git a/ggml/src/ggml-hexagon/htp-kparams.cpp b/ggml/src/ggml-hexagon/htp-kparams.cpp
+index 2fbd419ac..e9260f83c 100644
+--- a/ggml/src/ggml-hexagon/htp-kparams.cpp
++++ b/ggml/src/ggml-hexagon/htp-kparams.cpp
+@@ -1136,7 +1136,9 @@ bool htp_kparams_solve_mmnx(
+         const size_t act_row_size  = htp_mm_tiled_act_row_size(wtype, ne10);
+         const size_t src0_row_size = src0->nb[1];
+ 
+-        const uint32_t max_prefetch = (act_nrows > HTP_MM_HMX_MIN_NROWS) ? 2 : 16;
++        // x-elite-35b port: for MUL_MAT_ID the activation rows are n_expert_used x tokens; the vector kernel streams one
++        // row per expert, so the prefetch depth is decided by the token count (decode: ne12 * ne13 == 1 -> 16 deep).
++        const uint32_t max_prefetch = ((uint32_t) (ne12 * ne13) > HTP_MM_HMX_MIN_NROWS) ? 2 : 16;
+         uint32_t best_n_prefetch = 2;
+         for (uint32_t d = max_prefetch; d >= 2; d /= 2) {
+             struct htp_mm_hvx_vtcm_layout L;
 diff --git a/ggml/src/ggml-hexagon/htp/gated-delta-net-ops.c b/ggml/src/ggml-hexagon/htp/gated-delta-net-ops.c
 index 0280f99a4..05e25e0bf 100644
 --- a/ggml/src/ggml-hexagon/htp/gated-delta-net-ops.c
@@ -958,10 +973,10 @@ index 000000000..e7dca554b
 +SOFTWARE.
 diff --git a/ggml/src/ggml-hexagon/htp/qedge_prefill4/candidate.c b/ggml/src/ggml-hexagon/htp/qedge_prefill4/candidate.c
 new file mode 100644
-index 000000000..2b35549de
+index 000000000..fdb8b3f22
 --- /dev/null
 +++ b/ggml/src/ggml-hexagon/htp/qedge_prefill4/candidate.c
-@@ -0,0 +1,95 @@
+@@ -0,0 +1,106 @@
 +/* SPDX-License-Identifier: MIT
 + * Qf32 convolution and four-tap weight deinterleave adapted from llama.cpp,
 + * commit 94256114c229674ef96e76eb2dea596e65b43818, ggml-hexagon/htp/ssm-conv.c.
@@ -974,7 +989,7 @@ index 000000000..2b35549de
 +
 +void prefill4_hvx(const float *restrict x, const float *restrict old,
 +                 const float *restrict weight, float *restrict y, float *restrict next,
-+                 unsigned tokens, unsigned channels) {
++                 unsigned tokens, unsigned channels, unsigned tree_order) {
 +    union { HVX_Vector vec[3]; float f[3][32]; } history[KDA_MAX_C/32];
 +    HVX_Vector wt[KDA_MAX_C/32][4];
 +    kda_phase_begin(KDA_PREP);
@@ -1004,10 +1019,21 @@ index 000000000..2b35549de
 +        #pragma clang loop unroll_count(4)
 +        for (unsigned t = 0; t < tokens; ++t) {
 +            HVX_Vector x3 = *(const HVX_Vector *)(x + t*channels + c);
-+            // same tree order as the stock d_conv == 4 decode kernel (ssm-conv.c): (h0w0 + h1w1) + (h2w2 + x3w3)
-+            HVX_Vector a = Q6_Vqf32_vadd_Vqf32Vqf32(Q6_Vqf32_vmpy_VsfVsf(h0, w0), Q6_Vqf32_vmpy_VsfVsf(h1, w1));
-+            HVX_Vector b = Q6_Vqf32_vadd_Vqf32Vqf32(Q6_Vqf32_vmpy_VsfVsf(h2, w2), Q6_Vqf32_vmpy_VsfVsf(x3, w3));
-+            *(HVX_Vector *)(y + t*channels + c) = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_Vqf32Vqf32(a, b));
++            HVX_Vector sum;
++            if (tree_order) {
++                // stock d_conv == 4 decode kernel (ssm-conv.c): (h0w0 + h1w1) + (h2w2 + x3w3)
++                HVX_Vector a = Q6_Vqf32_vadd_Vqf32Vqf32(Q6_Vqf32_vmpy_VsfVsf(h0, w0), Q6_Vqf32_vmpy_VsfVsf(h1, w1));
++                HVX_Vector b = Q6_Vqf32_vadd_Vqf32Vqf32(Q6_Vqf32_vmpy_VsfVsf(h2, w2), Q6_Vqf32_vmpy_VsfVsf(x3, w3));
++                sum = Q6_Vqf32_vadd_Vqf32Vqf32(a, b);
++            } else {
++                // stock prefill kernel: acc = 0; acc += x_j * w_j for j = 0..3
++                sum = Q6_V_vzero();   // same bits as the stock zero start (sf 0.0)
++                sum = Q6_Vqf32_vadd_Vqf32Vqf32(sum, Q6_Vqf32_vmpy_VsfVsf(h0, w0));
++                sum = Q6_Vqf32_vadd_Vqf32Vqf32(sum, Q6_Vqf32_vmpy_VsfVsf(h1, w1));
++                sum = Q6_Vqf32_vadd_Vqf32Vqf32(sum, Q6_Vqf32_vmpy_VsfVsf(h2, w2));
++                sum = Q6_Vqf32_vadd_Vqf32Vqf32(sum, Q6_Vqf32_vmpy_VsfVsf(x3, w3));
++            }
++            *(HVX_Vector *)(y + t*channels + c) = Q6_Vsf_equals_Vqf32(sum);
 +            h0 = h1; h1 = h2; h2 = x3;
 +        }
 +    }
@@ -1059,7 +1085,7 @@ index 000000000..2b35549de
 +}
 diff --git a/ggml/src/ggml-hexagon/htp/qedge_prefill4/kernel.h b/ggml/src/ggml-hexagon/htp/qedge_prefill4/kernel.h
 new file mode 100644
-index 000000000..7a261bb26
+index 000000000..e23421e56
 --- /dev/null
 +++ b/ggml/src/ggml-hexagon/htp/qedge_prefill4/kernel.h
 @@ -0,0 +1,27 @@
@@ -1077,7 +1103,7 @@ index 000000000..7a261bb26
 +
 +void prefill4_hvx(const float *restrict x, const float *restrict old,
 +                 const float *restrict weight, float *restrict y, float *restrict next,
-+                 unsigned tokens, unsigned channels);
++                 unsigned tokens, unsigned channels, unsigned tree_order);
 +
 +// Phase cycles use separate unscored binaries. The latency score measures the
 +// full call with these hooks compiled out; phases are contiguous, once each.
@@ -1091,7 +1117,7 @@ index 000000000..7a261bb26
 +
 +#endif
 diff --git a/ggml/src/ggml-hexagon/htp/ssm-conv.c b/ggml/src/ggml-hexagon/htp/ssm-conv.c
-index d75304fef..787fd7812 100644
+index d75304fef..72f25ea9b 100644
 --- a/ggml/src/ggml-hexagon/htp/ssm-conv.c
 +++ b/ggml/src/ggml-hexagon/htp/ssm-conv.c
 @@ -20,6 +20,8 @@
@@ -1160,7 +1186,7 @@ index d75304fef..787fd7812 100644
 +        }
 +        dma_queue_flush(q);
 +        htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) c);
-+        prefill4_hvx(x, old, weight, y, next, tokens, tile);
++        prefill4_hvx(x, old, weight, y, next, tokens, tile, tokens == 1 /* tree order = stock decode kernel; sequential = stock prefill kernel */);
 +        if (task->silu) {
 +            // same primitive as the stock fused SSM_CONV+SILU kernel (hvx_ssm_conv_silu_vtcm), so y is bit-identical
 +            HVX_Vector * restrict vy = (HVX_Vector *) y;
@@ -1186,7 +1212,7 @@ index d75304fef..787fd7812 100644
 +    const uint32_t tokens   = kp->n_t;
 +    const uint32_t channels = kp->d_inner;
 +    struct htp_context * ctx = octx->ctx;
-+    if (tokens != 1 || channels == 0 || (channels % HTP_SSM_DIRECT_SLICE) != 0 || ctx->mdev.count > 1) {
++    if (tokens == 0 || tokens > HTP_SSM_DIRECT_MAX_T || channels == 0 || (channels % HTP_SSM_DIRECT_SLICE) != 0 || ctx->mdev.count > 1) {
 +        return HTP_STATUS_NO_SUPPORT;
 +    }
 +    if (!htp_ops_context_set_n_hvx(octx, kp->n_hvx)) {
@@ -1239,7 +1265,7 @@ index d75304fef..787fd7812 100644
  
      switch (dst->type) {
 diff --git a/ggml/src/ggml-hexagon/htp/ssm-conv.h b/ggml/src/ggml-hexagon/htp/ssm-conv.h
-index 7c3f3041f..efb787b76 100644
+index 7c3f3041f..ffbfc40f9 100644
 --- a/ggml/src/ggml-hexagon/htp/ssm-conv.h
 +++ b/ggml/src/ggml-hexagon/htp/ssm-conv.h
 @@ -8,6 +8,15 @@
@@ -1249,7 +1275,7 @@ index 7c3f3041f..efb787b76 100644
 +// SSM_CONV_DIRECT (decode): src[0] = x [C, T], src[1] = old state [3, C], src[2] = weight [4, C];
 +// dsts[0] = next state [3C, 1] (the recurrent-cache slot), dsts[1] = y [C, T] (SiLU applied when kparams->silu).
 +// The host selects it by giving the op three inputs and two outputs; see htp_conv_direct_* in ggml-hexagon.cpp.
-+enum { HTP_SSM_DIRECT_SLICE = 128 };
++enum { HTP_SSM_DIRECT_SLICE = 128, HTP_SSM_DIRECT_MAX_T = 1024 };   // MAX_T = KDA_MAX_T of the prefill4 kernel
 +
 +static inline uint32_t htp_ssm_direct_vtcm_bytes_per_thread(uint32_t tokens) {
 +    return (2 * tokens + 3 + 4 + 3) * HTP_SSM_DIRECT_SLICE * sizeof(float);
@@ -1259,14 +1285,14 @@ index 7c3f3041f..efb787b76 100644
      uint32_t n_hvx;
      uint32_t d_conv;
 diff --git a/src/models/qwen35.cpp b/src/models/qwen35.cpp
-index 6ec3cff44..f55dab2e7 100644
+index 6ec3cff44..ad65e70d7 100644
 --- a/src/models/qwen35.cpp
 +++ b/src/models/qwen35.cpp
 @@ -388,6 +388,13 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
      cb(state, "state_predelta", il);
  
      ggml_tensor * conv_output_proper = ggml_ssm_conv(ctx0, conv_input, conv_kernel);
-+    if (n_seqs == 1 && n_seq_tokens == 1 && conv_kernel_size == 4 && (conv_channels % 128) == 0 &&
++    if (n_seqs == 1 && n_seq_tokens >= 1 && n_seq_tokens <= 1024 && conv_kernel_size == 4 && (conv_channels % 128) == 0 &&
 +        conv_kernel->ne[1] == conv_channels) {
 +        // Pin the unmaterialized operands (old state, new token) for the Hexagon direct conv; ordinary
 +        // backends keep using src[0:2].
@@ -1277,14 +1303,14 @@ index 6ec3cff44..f55dab2e7 100644
  
      ggml_tensor * conv_output_silu = ggml_silu(ctx0, conv_output_proper);
 diff --git a/src/models/qwen35moe.cpp b/src/models/qwen35moe.cpp
-index c0ee6fa03..e759730b5 100644
+index c0ee6fa03..ad248e9b7 100644
 --- a/src/models/qwen35moe.cpp
 +++ b/src/models/qwen35moe.cpp
 @@ -398,6 +398,13 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn_linear(
      cb(state, "state_predelta", il);
  
      ggml_tensor * conv_output_proper = ggml_ssm_conv(ctx0, conv_input, conv_kernel);
-+    if (n_seqs == 1 && n_seq_tokens == 1 && conv_kernel_size == 4 && (conv_channels % 128) == 0 &&
++    if (n_seqs == 1 && n_seq_tokens >= 1 && n_seq_tokens <= 1024 && conv_kernel_size == 4 && (conv_channels % 128) == 0 &&
 +        conv_kernel->ne[1] == conv_channels) {
 +        // Pin the unmaterialized operands (old state, new token) for the Hexagon direct conv; ordinary
 +        // backends keep using src[0:2].
