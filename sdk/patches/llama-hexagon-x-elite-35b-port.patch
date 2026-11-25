@@ -1,13 +1,14 @@
 diff --git a/ggml/src/ggml-hexagon/ggml-hexagon.cpp b/ggml/src/ggml-hexagon/ggml-hexagon.cpp
-index c38d0005c..c9298fdde 100644
+index c38d0005c..ef947239e 100644
 --- a/ggml/src/ggml-hexagon/ggml-hexagon.cpp
 +++ b/ggml/src/ggml-hexagon/ggml-hexagon.cpp
-@@ -137,6 +137,12 @@ int    opt_fa_select     = 2; // 2 = HMX -> HVX -> CPU, 1 = HVX -> CPU, 0 = CPU
+@@ -137,6 +137,13 @@ int    opt_fa_select     = 2; // 2 = HMX -> HVX -> CPU, 1 = HVX -> CPU, 0 = CPU
  int    opt_fa_split      = 1; // 1 = head-split + team-split when n_kv_heads < N_cores (default), 0 = off
  int    opt_li_select     = 2; // 2 = HMX -> HVX, 1 = HVX, 0 = CPU (unsupported)
  int    opt_gdn_select    = 2; // 2 = HMX -> HVX, 1 = HVX, 0 = CPU (unsupported)
 +int    opt_gdn_fold      = 1; // decode-time GDN folds: 1 = state-direct + gates, 0 = off (GGML_HEXAGON_GDN_FOLD)
 +int    opt_gdn_depth     = 2; // decode GDN: state buffers per HVX thread in the DMA ring, 2 = stock (GGML_HEXAGON_GDN_DEPTH)
++int    opt_gdn_wb        = 0; // decode GDN: 1 = HVX-store state write-back instead of DMA (GGML_HEXAGON_GDN_WB)
 +int    opt_mv_group      = 4; // decode matmul: weight column tiles per DMA descriptor, one ring for all weights of an NX op (GGML_HEXAGON_MV_GROUP), 0 = stock
 +size_t opt_batch_vmem    = 0; // cap on the buffer bytes of one op batch (GGML_HEXAGON_BATCH_VMEM, MiB); 0 = max_vmem
 +int    opt_mmid_hmx_min_rows = 0; // MUL_MAT_ID: use HVX below this many activation rows per expert (GGML_HEXAGON_MMID_HMX_MIN_ROWS), 0 = stock
@@ -15,7 +16,7 @@ index c38d0005c..c9298fdde 100644
  int    opt_ar_select     = 2; // 2 = fused ALLREDUCE+ADD (default), 1 = unfused ALLREDUCE, 0 = fallback to CPY+FENCE
  int    opt_ar_scatter    = 1; // 1 = reduce-scatter the fused ALLREDUCE+ADD (default), 0 = full reduction
  
-@@ -166,6 +172,15 @@ static const char * status_to_str(uint32_t status) {
+@@ -166,6 +173,15 @@ static const char * status_to_str(uint32_t status) {
              return "VTCM-TOO-SMALL";
          case HTP_STATUS_INTERNAL_ERR:
              return "INTERNAL-ERROR";
@@ -31,7 +32,7 @@ index c38d0005c..c9298fdde 100644
          default:
              return "UNKNOWN";
      }
-@@ -1215,7 +1230,8 @@ struct ggml_hexagon_opbatch {
+@@ -1215,7 +1231,8 @@ struct ggml_hexagon_opbatch {
      unsigned int n_bufs_max;
      unsigned int n_tens_max;
      unsigned int n_ops_max;
@@ -41,7 +42,7 @@ index c38d0005c..c9298fdde 100644
  
      void reset() {
          n_bufs = 0;
-@@ -1234,7 +1250,8 @@ struct ggml_hexagon_opbatch {
+@@ -1234,7 +1251,8 @@ struct ggml_hexagon_opbatch {
          n_ops_max  = batch_size;
          n_tens_max = std::min<size_t>(n_ops_max * 4 + HTP_OP_MAX_INPUTS + HTP_OP_MAX_OUTPUTS, HTP_OP_MAX_TENSORS);
  
@@ -51,7 +52,7 @@ index c38d0005c..c9298fdde 100644
  
          ops.resize(n_ops_max);
  
-@@ -1422,9 +1439,16 @@ struct ggml_hexagon_opbatch {
+@@ -1422,9 +1440,16 @@ struct ggml_hexagon_opbatch {
              fit_tensor(output);
          }
  
@@ -71,7 +72,7 @@ index c38d0005c..c9298fdde 100644
  
          return true;
      }
-@@ -2440,6 +2464,332 @@ static void ggml_hexagon_graph_repack(const ggml_cgraph * graph, ggml_hexagon_se
+@@ -2440,6 +2465,332 @@ static void ggml_hexagon_graph_repack(const ggml_cgraph * graph, ggml_hexagon_se
      }
  }
  
@@ -404,7 +405,7 @@ index c38d0005c..c9298fdde 100644
  static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, ggml_cgraph * graph) {
      auto sess = static_cast<ggml_hexagon_session *>(backend->context);
  
-@@ -2462,9 +2812,15 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
+@@ -2462,9 +2813,15 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
  
          computed_nodes.reserve(graph->n_nodes);
  
@@ -421,7 +422,7 @@ index c38d0005c..c9298fdde 100644
                  continue;
              }
  
-@@ -2476,6 +2832,25 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
+@@ -2476,6 +2833,25 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
              htp_opnode node(opcode, n);
              GGML_ASSERT(htp_kparams_solve(sess, node));
  
@@ -447,26 +448,28 @@ index c38d0005c..c9298fdde 100644
              computed_nodes.push_back(std::move(node));
          }
  
-@@ -3468,6 +3843,12 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
+@@ -3468,6 +3844,13 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
      const char * str_fa_split  = getenv("GGML_HEXAGON_FA_SPLIT");
      const char * str_li_select = getenv("GGML_HEXAGON_LI_SELECT");
      const char * str_gdn_select = getenv("GGML_HEXAGON_GDN_SELECT");
 +    const char * str_gdn_fold = getenv("GGML_HEXAGON_GDN_FOLD");
 +    const char * str_gdn_depth = getenv("GGML_HEXAGON_GDN_DEPTH");
 +    const char * str_mv_group = getenv("GGML_HEXAGON_MV_GROUP");
++    const char * str_gdn_wb = getenv("GGML_HEXAGON_GDN_WB");
 +    const char * str_conv_fold = getenv("GGML_HEXAGON_CONV_FOLD");
 +    const char * str_batch_vmem = getenv("GGML_HEXAGON_BATCH_VMEM");
 +    const char * str_mmid_hmx = getenv("GGML_HEXAGON_MMID_HMX_MIN_ROWS");
      const char * str_ar_select = getenv("GGML_HEXAGON_AR_SELECT");
      const char * str_ar_scatter = getenv("GGML_HEXAGON_AR_SCATTER");
      const char * str_ndev     = getenv("GGML_HEXAGON_NDEV");
-@@ -3535,6 +3916,12 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
+@@ -3535,6 +3918,13 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
      opt_fa_split  = str_fa_split  ? atoi(str_fa_split)                   : opt_fa_split;
      opt_li_select = str_li_select ? atoi(str_li_select)                   : opt_li_select;
      opt_gdn_select    = str_gdn_select    ? atoi(str_gdn_select)          : opt_gdn_select;
 +    opt_gdn_fold      = str_gdn_fold      ? atoi(str_gdn_fold)            : opt_gdn_fold;
 +    opt_gdn_depth     = str_gdn_depth     ? atoi(str_gdn_depth)           : opt_gdn_depth;
 +    opt_mv_group      = str_mv_group      ? atoi(str_mv_group)            : opt_mv_group;
++    opt_gdn_wb        = str_gdn_wb        ? atoi(str_gdn_wb)              : opt_gdn_wb;
 +    opt_conv_fold     = str_conv_fold     ? atoi(str_conv_fold)           : opt_conv_fold;
 +    opt_batch_vmem    = str_batch_vmem    ? strtoul(str_batch_vmem, NULL, 0) * 1024u * 1024u : opt_batch_vmem;
 +    opt_mmid_hmx_min_rows = str_mmid_hmx  ? atoi(str_mmid_hmx)               : opt_mmid_hmx_min_rows;
@@ -474,15 +477,16 @@ index c38d0005c..c9298fdde 100644
      opt_ar_scatter    = str_ar_scatter    ? atoi(str_ar_scatter)          : opt_ar_scatter;
  
 diff --git a/ggml/src/ggml-hexagon/htp-common.h b/ggml/src/ggml-hexagon/htp-common.h
-index 4e9e54415..435955dfa 100644
+index 4e9e54415..8cb76ae6e 100644
 --- a/ggml/src/ggml-hexagon/htp-common.h
 +++ b/ggml/src/ggml-hexagon/htp-common.h
-@@ -25,6 +25,12 @@ extern int    opt_fa_select;
+@@ -25,6 +25,13 @@ extern int    opt_fa_select;
  extern int    opt_fa_split;
  extern int    opt_li_select;
  extern int    opt_gdn_select;
 +extern int    opt_gdn_fold;
 +extern int    opt_gdn_depth;
++extern int    opt_gdn_wb;
 +extern int    opt_mv_group;
 +extern int    opt_conv_fold;
 +extern size_t opt_batch_vmem;
@@ -507,7 +511,7 @@ index eb0862669..a70ca6ef3 100644
      if (htp_tensors_overlap(dst, prev.src0()) || htp_tensors_overlap(dst, prev.src1())) return false;
  
 diff --git a/ggml/src/ggml-hexagon/htp-kparams.cpp b/ggml/src/ggml-hexagon/htp-kparams.cpp
-index 2fbd419ac..f6b864655 100644
+index 2fbd419ac..e9e130650 100644
 --- a/ggml/src/ggml-hexagon/htp-kparams.cpp
 +++ b/ggml/src/ggml-hexagon/htp-kparams.cpp
 @@ -567,6 +567,7 @@ static bool htp_kparams_solve_gated_delta_net(
@@ -531,15 +535,16 @@ index 2fbd419ac..f6b864655 100644
          if (hvx_layout.total_bytes > vtcm_size) {
              return false;
          }
-@@ -587,6 +592,7 @@ static bool htp_kparams_solve_gated_delta_net(
+@@ -587,6 +592,8 @@ static bool htp_kparams_solve_gated_delta_net(
      }
  
      kparams->n_hvx               = n_hvx;
 +    kparams->prefetch_depth      = gdn_depth;
++    if (opt_gdn_wb) kparams->flags |= HTP_GDN_FLAG_HVX_WB;
      kparams->S_v                 = (uint32_t) S_v;
      kparams->H                   = (uint32_t) H;
      kparams->n_tokens            = (uint32_t) n_tokens;
-@@ -802,6 +808,7 @@ static void htp_kparams_solve_hvx_mm(
+@@ -802,6 +809,7 @@ static void htp_kparams_solve_hvx_mm(
                  return;
              }
              kparams->n_prefetch     = best_n_prefetch;
@@ -547,7 +552,7 @@ index 2fbd419ac..f6b864655 100644
              kparams->vtcm_size      = L.total_bytes;
              kparams->vtcm_bias_size = 0;
              return;
-@@ -831,6 +838,7 @@ static void htp_kparams_solve_hvx_mm(
+@@ -831,6 +839,7 @@ static void htp_kparams_solve_hvx_mm(
                          dst->nb[1], src0->nb[1], src1->nb[1], src2_row_size, best_n_prefetch, vtcm_budget,
                          &L, &m_chunk)) {
                      kparams->n_prefetch     = best_n_prefetch;
@@ -555,7 +560,7 @@ index 2fbd419ac..f6b864655 100644
                      kparams->m_chunk        = (m_chunk < (uint32_t) src1_nrows) ? m_chunk : 0;
                      kparams->vtcm_size      = L.total_bytes;
                      kparams->vtcm_bias_size = L.bias_bytes;
-@@ -866,6 +874,7 @@ static void htp_kparams_solve_hvx_mm(
+@@ -866,6 +875,7 @@ static void htp_kparams_solve_hvx_mm(
              kparams->vtcm_size      = L.total_bytes;
              kparams->vtcm_bias_size = L.bias_bytes;
              kparams->n_prefetch     = 16;
@@ -563,7 +568,7 @@ index 2fbd419ac..f6b864655 100644
              return;
          }
      }
-@@ -904,7 +913,12 @@ static bool htp_kparams_solve_matmul_impl(
+@@ -904,7 +914,12 @@ static bool htp_kparams_solve_matmul_impl(
      const bool   is_batched   = (ne02 * ne03 > 1 || ne12 * ne13 > 1);
      const size_t vtcm_budget  = htp_session_vtcm_size(sess);
  
@@ -577,7 +582,7 @@ index 2fbd419ac..f6b864655 100644
      if (hmx_enabled && htp_matmul_is_hmx_eligible(src0, src1, dst, is_matmul_id, is_batched)) {
          if (htp_kparams_solve_hmx_mm(sess, src0, src1, dst, wtype, ne00_padded, ne01_tiled, ne02, ne11, ne12, ne11_padded, is_matmul_id, is_batched, src2_size, vtcm_budget, kparams)) {
              goto finalize;
-@@ -1118,7 +1132,12 @@ bool htp_kparams_solve_mmnx(
+@@ -1118,7 +1133,12 @@ bool htp_kparams_solve_mmnx(
      const int  ne01_tiled  = hex_round_up(ne01, 32);
      const bool is_batched  = (ne02 * ne03 > 1 || ne12 * ne13 > 1);
  
@@ -591,7 +596,7 @@ index 2fbd419ac..f6b864655 100644
      if (hmx_enabled && htp_matmul_is_hmx_eligible(src0, act, nullptr, false, is_batched)) {
          if (htp_kparams_solve_hmx_mm(sess, src0, act, nullptr, wtype, ne00_padded, ne01_tiled, ne02, ne11, ne12, ne11_padded, false, is_batched, 0, vtcm_budget, kparams)) {
              kparams->n_weights = n_weights;
-@@ -1136,7 +1155,9 @@ bool htp_kparams_solve_mmnx(
+@@ -1136,7 +1156,9 @@ bool htp_kparams_solve_mmnx(
          const size_t act_row_size  = htp_mm_tiled_act_row_size(wtype, ne10);
          const size_t src0_row_size = src0->nb[1];
  
@@ -602,7 +607,7 @@ index 2fbd419ac..f6b864655 100644
          uint32_t best_n_prefetch = 2;
          for (uint32_t d = max_prefetch; d >= 2; d /= 2) {
              struct htp_mm_hvx_vtcm_layout L;
-@@ -1164,6 +1185,7 @@ bool htp_kparams_solve_mmnx(
+@@ -1164,6 +1186,7 @@ bool htp_kparams_solve_mmnx(
              kparams->vtcm_bias_size    = 0;
              kparams->vtcm_size         = L.total_bytes;
              kparams->n_prefetch        = best_n_prefetch;
@@ -611,7 +616,7 @@ index 2fbd419ac..f6b864655 100644
          } else {
              kparams->kernel_type = HTP_MM_KERNEL_UNSUPPORTED;
 diff --git a/ggml/src/ggml-hexagon/htp/gated-delta-net-ops.c b/ggml/src/ggml-hexagon/htp/gated-delta-net-ops.c
-index 0280f99a4..e7ad67a6c 100644
+index 0280f99a4..51cee910c 100644
 --- a/ggml/src/ggml-hexagon/htp/gated-delta-net-ops.c
 +++ b/ggml/src/ggml-hexagon/htp/gated-delta-net-ops.c
 @@ -8,6 +8,7 @@
@@ -712,12 +717,13 @@ index 0280f99a4..e7ad67a6c 100644
  
      const struct fastdiv_values * fd_H   = &kparams->div_H;
      const struct fastdiv_values * fd_q1  = &kparams->div_q1;
-@@ -930,17 +1002,22 @@ static void gated_delta_net_f32_tg_thread(const htp_thread_t * th, unsigned int
+@@ -930,23 +1002,31 @@ static void gated_delta_net_f32_tg_thread(const htp_thread_t * th, unsigned int
      const struct fastdiv_values * fd_rq3 = &kparams->div_rq3;
      const struct fastdiv_values * fd_rk3 = &kparams->div_rk3;
  
 -    const uint32_t state_seq_stride = kparams->state_seq_stride;
 +    const bool fused_gates = (kparams->flags & HTP_GDN_FLAG_GATES) != 0;
++    const bool hvx_wb      = (kparams->flags & HTP_GDN_FLAG_HVX_WB) != 0;   // state write-back by vector stores, fetch-only DMA ring
 +    float * gate_g = NULL;
 +    float * gate_b = NULL;
 +    if (fused_gates) {
@@ -739,7 +745,18 @@ index 0280f99a4..e7ad67a6c 100644
          dma_addr_t ps_out = state_out_dma_base + ((uint64_t) piv3 * H + piv1) * S_v * S_v * sizeof(float);
  
          // Push dummy write-back
-@@ -954,7 +1031,7 @@ static void gated_delta_net_f32_tg_thread(const htp_thread_t * th, unsigned int
+-        dma_queue_push(dma_q, dma_make_data(ps_out, s_work[spad_idx]),
+-                       S_v * sizeof(float), S_v * sizeof(float),
+-                       S_v * sizeof(float), 0);
++        if (!hvx_wb) {
++            dma_queue_push(dma_q, dma_make_data(ps_out, s_work[spad_idx]),
++                           S_v * sizeof(float), S_v * sizeof(float),
++                           S_v * sizeof(float), 0);
++        }
+ 
+         // Push fetch
+         dma_queue_push(dma_q, dma_make_data(s_work[spad_idx], ps_in),
+@@ -954,14 +1034,16 @@ static void gated_delta_net_f32_tg_thread(const htp_thread_t * th, unsigned int
                         S_v * sizeof(float), S_v);
  
          ir_prefetch += nth;
@@ -748,7 +765,17 @@ index 0280f99a4..e7ad67a6c 100644
      }
  
      struct htp_thread_trace * tr = th->trace;
-@@ -983,9 +1060,9 @@ static void gated_delta_net_f32_tg_thread(const htp_thread_t * th, unsigned int
+ 
+     int curr_spad_idx = 0;
+     for (uint32_t ir = gctx->row_start + ith; ir < row_end; ir += nth) {
+-        dma_queue_pop(dma_q);
++        if (!hvx_wb) {
++            dma_queue_pop(dma_q);
++        }
+         dma_queue_pop(dma_q);
+ 
+         float * s_work_curr = s_work[curr_spad_idx];
+@@ -983,9 +1065,9 @@ static void gated_delta_net_f32_tg_thread(const htp_thread_t * th, unsigned int
                  (uint64_t) ik3 * k->nb[3] + (uint64_t) ik1 * k->nb[1]);
          const float * v_t = (const float *) ((const uint8_t *) (uintptr_t) v->data +
                  (uint64_t) iv3 * v->nb[3] + (uint64_t) iv1 * v->nb[1]);
@@ -760,7 +787,22 @@ index 0280f99a4..e7ad67a6c 100644
                  (uint64_t) iv3 * beta->nb[3] + (uint64_t) iv1 * beta->nb[1]);
  
          htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) ir);
-@@ -1005,17 +1082,17 @@ static void gated_delta_net_f32_tg_thread(const htp_thread_t * th, unsigned int
+@@ -997,25 +1079,29 @@ static void gated_delta_net_f32_tg_thread(const htp_thread_t * th, unsigned int
+         htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) ir);
+ 
+         // Push real write-back
+-        dma_queue_push(dma_q, dma_make_data(s_out, s_work_curr),
+-                       S_v * sizeof(float), S_v * sizeof(float),
+-                       S_v * sizeof(float), S_v);
++        if (hvx_wb) {
++            hvx_copy_f32_ua((uint8_t *) (uintptr_t) s_out, (const uint8_t *) s_work_curr, S_v * S_v);
++        } else {
++            dma_queue_push(dma_q, dma_make_data(s_out, s_work_curr),
++                           S_v * sizeof(float), S_v * sizeof(float),
++                           S_v * sizeof(float), S_v);
++        }
+ 
+         // Prefetch next block (if any)
          if (ir_prefetch < row_end) {
              const uint32_t piv1 = fastmodulo(ir_prefetch, H, fd_H);
              const uint32_t piv3 = fastdiv(ir_prefetch, fd_H);
@@ -781,7 +823,7 @@ index 0280f99a4..e7ad67a6c 100644
      }
      dma_queue_flush(dma_q);
  }
-@@ -2329,7 +2406,7 @@ int op_gated_delta_net(struct htp_ops_context * octx) {
+@@ -2329,7 +2415,7 @@ int op_gated_delta_net(struct htp_ops_context * octx) {
      gctx.row_start = row_start;
      gctx.nrows     = nrows;
  
@@ -791,10 +833,10 @@ index 0280f99a4..e7ad67a6c 100644
  
      if (gctx.layout.total_bytes > octx->ctx->vtcm_size) {
 diff --git a/ggml/src/ggml-hexagon/htp/gated-delta-net-ops.h b/ggml/src/ggml-hexagon/htp/gated-delta-net-ops.h
-index aff1eb645..6188f2a04 100644
+index aff1eb645..97529f235 100644
 --- a/ggml/src/ggml-hexagon/htp/gated-delta-net-ops.h
 +++ b/ggml/src/ggml-hexagon/htp/gated-delta-net-ops.h
-@@ -13,6 +13,13 @@
+@@ -13,6 +13,14 @@
  #define HTP_GDN_CHUNK_SIZE 64
  #define HTP_GDN_MIN_TOKENS 8
  
@@ -803,12 +845,13 @@ index aff1eb645..6188f2a04 100644
 +//  GATES:        src[3] = alpha, src[4] = beta_raw, src[7] = dt_bias, src[8] = A; g/beta are computed in-kernel
 +#define HTP_GDN_FLAG_STATE_DIRECT 1u
 +#define HTP_GDN_FLAG_GATES        2u
++#define HTP_GDN_FLAG_HVX_WB       4u   // decode: write the new state back with HVX stores instead of DMA (GGML_HEXAGON_GDN_WB)
 +#define HTP_GDN_MAX_DEPTH         8u
 +
  #ifndef HMX_FP16_TILE_SIZE
  #define HMX_FP16_TILE_SIZE 2048
  #endif
-@@ -43,6 +50,8 @@ struct htp_gdn_kernel_params {
+@@ -43,6 +51,8 @@ struct htp_gdn_kernel_params {
      uint32_t state_size_per_snap;
  
      float    scale;
@@ -817,7 +860,7 @@ index aff1eb645..6188f2a04 100644
  
      struct fastdiv_values div_H;
      struct fastdiv_values div_q1;
-@@ -67,11 +76,13 @@ struct htp_gdn_vtcm_layout {
+@@ -67,11 +77,13 @@ struct htp_gdn_vtcm_layout {
  static inline void htp_gdn_vtcm_layout_build(
      struct htp_gdn_vtcm_layout * L,
      uint32_t S_v,
