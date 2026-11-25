@@ -65,6 +65,25 @@ llama_model_params build_model_params(const geniex_ModelConfig& config, Device d
     llama_model_params mpar = llama_model_default_params();
     mpar.load_mode          = use_mmap ? LLAMA_LOAD_MODE_MMAP : LLAMA_LOAD_MODE_NONE;
     mpar.n_gpu_layers       = config.n_gpu_layers;
+
+    // x-elite experiments: explicit CPU placement of the MoE expert weights (llama.cpp --cpu-moe / --n-cpu-moe),
+    // so the hybrid CPU+NPU split does not depend on an op being unsupported by the NPU backend.
+    //   GENIEX_LLAMA_CPU_MOE=1     all expert weights on the CPU
+    //   GENIEX_LLAMA_N_CPU_MOE=N   expert weights of the first N layers on the CPU
+    static std::vector<llama_model_tensor_buft_override> s_tensor_overrides;
+    s_tensor_overrides.clear();
+    const char* env_cpu_moe   = std::getenv("GENIEX_LLAMA_CPU_MOE");
+    const char* env_n_cpu_moe = std::getenv("GENIEX_LLAMA_N_CPU_MOE");
+    if (env_cpu_moe && std::atoi(env_cpu_moe) > 0) {
+        s_tensor_overrides.push_back(llm_ffn_exps_cpu_override());
+    } else if (env_n_cpu_moe && std::atoi(env_n_cpu_moe) > 0) {
+        llm_add_n_cpu_ffn_overrides(std::atoi(env_n_cpu_moe), LLM_FFN_EXPS_REGEX, s_tensor_overrides);
+    }
+    if (!s_tensor_overrides.empty()) {
+        s_tensor_overrides.push_back({nullptr, nullptr});
+        mpar.tensor_buft_overrides = s_tensor_overrides.data();
+        GENIEX_LOG_INFO("[Optimise] tensor overrides: {} MoE expert pattern(s) pinned to the CPU", s_tensor_overrides.size() - 1);
+    }
     GENIEX_LOG_INFO("[Optimise] model params: n_gpu_layers={}, load_mode={}",
         mpar.n_gpu_layers,
         llama_load_mode_name(mpar.load_mode));
@@ -128,6 +147,13 @@ llama_context_params build_context_params(const geniex_ModelConfig& config, int3
     cpar.n_seq_max            = config.n_seq_max > 0 ? config.n_seq_max : 1;
     cpar.n_threads            = resolve_n_threads(config.n_threads, decode_threads);
     cpar.n_threads_batch      = resolve_n_threads(config.n_threads_batch);
+    // x-elite experiments: per-phase thread counts (decode / prefill) without touching the bench CLI
+    if (const char* env_t = std::getenv("GENIEX_LLAMA_THREADS"); env_t && std::atoi(env_t) > 0) {
+        cpar.n_threads = std::atoi(env_t);
+    }
+    if (const char* env_tb = std::getenv("GENIEX_LLAMA_THREADS_BATCH"); env_tb && std::atoi(env_tb) > 0) {
+        cpar.n_threads_batch = std::atoi(env_tb);
+    }
     cpar.flash_attn_type      = static_cast<llama_flash_attn_type>(fa);
     cpar.no_perf              = false;
 
