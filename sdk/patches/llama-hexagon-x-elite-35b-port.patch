@@ -1874,7 +1874,7 @@ index ad457d1a6..d93645b35 100644
  
      vtcm_release(ctx);
 diff --git a/ggml/src/ggml-hexagon/htp/matmul-ops.c b/ggml/src/ggml-hexagon/htp/matmul-ops.c
-index fb15310cf..42c570c55 100644
+index fb15310cf..863d31fe1 100644
 --- a/ggml/src/ggml-hexagon/htp/matmul-ops.c
 +++ b/ggml/src/ggml-hexagon/htp/matmul-ops.c
 @@ -248,6 +248,175 @@ static const uint8_t __attribute__((aligned(VLEN))) kvalues_mxfp4_lut[] = {
@@ -2461,12 +2461,12 @@ index fb15310cf..42c570c55 100644
 +    const size_t stage_size = hex_align_up(m_chunk * (size_t) k * sizeof(float), 128);
 +
 +    uint8_t * vp = (uint8_t *) ctx->vtcm_base;
-+    uint8_t * raw      = vtcm_seq_alloc(&vp, raw_size);
-+    __fp16 *  w16[2]   = { vtcm_seq_alloc(&vp, w16_size), vtcm_seq_alloc(&vp, w16_size) };
-+    __fp16 *  act16[2] = { vtcm_seq_alloc(&vp, act_size), vtcm_seq_alloc(&vp, act_size) };
-+    __fp16 *  out16[2] = { vtcm_seq_alloc(&vp, out_size), vtcm_seq_alloc(&vp, out_size) };
-+    float *   stage[2] = { vtcm_seq_alloc(&vp, stage_size), vtcm_seq_alloc(&vp, stage_size) };
-+    __fp16 *  scales   = vtcm_seq_alloc(&vp, 256);
++    uint8_t * raw      = (uint8_t *) vtcm_seq_alloc(&vp, raw_size);
++    __fp16 *  w16[2]   = { (__fp16 *) vtcm_seq_alloc(&vp, w16_size), (__fp16 *) vtcm_seq_alloc(&vp, w16_size) };
++    __fp16 *  act16[2] = { (__fp16 *) vtcm_seq_alloc(&vp, act_size), (__fp16 *) vtcm_seq_alloc(&vp, act_size) };
++    __fp16 *  out16[2] = { (__fp16 *) vtcm_seq_alloc(&vp, out_size), (__fp16 *) vtcm_seq_alloc(&vp, out_size) };
++    float *   stage[2] = { (float *) vtcm_seq_alloc(&vp, stage_size), (float *) vtcm_seq_alloc(&vp, stage_size) };
++    __fp16 *  scales   = (__fp16 *) vtcm_seq_alloc(&vp, 256);
 +    if ((size_t) (vp - (uint8_t *) ctx->vtcm_base) > ctx->vtcm_size) return -2;
 +    hmx_init_column_scales(scales, Q6_V_vsplat_R(0x3c00));
 +
