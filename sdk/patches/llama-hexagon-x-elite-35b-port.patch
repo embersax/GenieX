@@ -1,5 +1,5 @@
 diff --git a/ggml/src/ggml-hexagon/ggml-hexagon.cpp b/ggml/src/ggml-hexagon/ggml-hexagon.cpp
-index c38d0005c..6b5f5caa8 100644
+index c38d0005c..1d8baa570 100644
 --- a/ggml/src/ggml-hexagon/ggml-hexagon.cpp
 +++ b/ggml/src/ggml-hexagon/ggml-hexagon.cpp
 @@ -137,6 +137,14 @@ int    opt_fa_select     = 2; // 2 = HMX -> HVX -> CPU, 1 = HVX -> CPU, 0 = CPU
@@ -9,7 +9,7 @@ index c38d0005c..6b5f5caa8 100644
 +int    opt_gdn_fold      = 1; // decode-time GDN folds: 1 = state-direct + gates, 0 = off (GGML_HEXAGON_GDN_FOLD)
 +int    opt_gdn_depth     = 2; // decode GDN: state buffers per HVX thread in the DMA ring, 2 = stock (GGML_HEXAGON_GDN_DEPTH)
 +int    opt_gdn_wb        = 0; // decode GDN: 1 = HVX-store state write-back instead of DMA (GGML_HEXAGON_GDN_WB)
-+int    opt_topk_fold     = 1; // ARGSORT + VIEW(first k) solved as TOP_K (GGML_HEXAGON_TOPK_FOLD), 0 = stock argsort
++int    opt_topk_fold     = 0; // ARGSORT + VIEW(first k) solved as TOP_K (GGML_HEXAGON_TOPK_FOLD); default 0: the TOP_K path empties the output on the X Elite (session 5), under investigation
 +int    opt_mv_group      = 0; // decode matmul: weight column tiles per DMA descriptor, one ring for all weights of an NX op (GGML_HEXAGON_MV_GROUP); 0 = stock ring (default: grouping only helps the 8192-row NX op and slows every smaller dense op)
 +size_t opt_batch_vmem    = 0; // cap on the buffer bytes of one op batch (GGML_HEXAGON_BATCH_VMEM, MiB); 0 = max_vmem
 +int    opt_mmid_hmx_min_rows = 0; // MUL_MAT_ID: use HVX below this many activation rows per expert (GGML_HEXAGON_MMID_HMX_MIN_ROWS), 0 = stock
