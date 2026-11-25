@@ -1396,7 +1396,7 @@ index 000000000..e23421e56
 +
 +#endif
 diff --git a/ggml/src/ggml-hexagon/htp/ssm-conv.c b/ggml/src/ggml-hexagon/htp/ssm-conv.c
-index d75304fef..72f25ea9b 100644
+index d75304fef..88de8a903 100644
 --- a/ggml/src/ggml-hexagon/htp/ssm-conv.c
 +++ b/ggml/src/ggml-hexagon/htp/ssm-conv.c
 @@ -20,6 +20,8 @@
@@ -1465,7 +1465,7 @@ index d75304fef..72f25ea9b 100644
 +        }
 +        dma_queue_flush(q);
 +        htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) c);
-+        prefill4_hvx(x, old, weight, y, next, tokens, tile, tokens == 1 /* tree order = stock decode kernel; sequential = stock prefill kernel */);
++        prefill4_hvx(x, old, weight, y, next, tokens, tile, 1 /* tree order: both stock paths that run for d_conv == 4 (T == 1 verified, T > 1 the prefill fast path) */);
 +        if (task->silu) {
 +            // same primitive as the stock fused SSM_CONV+SILU kernel (hvx_ssm_conv_silu_vtcm), so y is bit-identical
 +            HVX_Vector * restrict vy = (HVX_Vector *) y;
