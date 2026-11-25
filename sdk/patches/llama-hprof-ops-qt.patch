@@ -1,0 +1,1095 @@
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index 961990f85..fd6c5a713 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -28,6 +28,385 @@
+ #include <sys/sysctl.h>
+ #endif
+ 
++//
++// hprof: host-side end-to-end timeline (diagnostic builds, see ggml-hprof.h)
++//
++
++#include "ggml-hprof.h"
++
++#include <atomic>
++#include <cstdarg>
++#include <string>
++#include <utility>
++
++#if defined(__linux__)
++#include <sched.h>
++#include <unistd.h>
++#endif
++
++namespace {
++
++struct ggml_hprof_event {
++    int64_t  t;
++    int32_t  kind;
++    uint64_t a;
++    uint64_t b;
++    uint64_t c;
++    uint64_t d;
++    char     name[128];
++};
++
++struct ggml_hprof_state {
++    int                            max_split_nodes = 16;
++    int                            max_decodes     = 512;   // stop recording after this many llama_decode calls (bounds the log size)
++    int                            n_decodes       = 0;
++    bool                           stopped         = false;
++    bool                           stop_printed    = false;
++    std::atomic<bool>              lock{false};
++    std::vector<ggml_hprof_event>  events;
++    std::string                    text;
++    size_t                         dropped = 0;
++    // current scheduler split (for NODE_DONE)
++    int                            cur_split       = -1;
++    int                            cur_split_nodes = 0;
++    int                            cur_node_k      = 0;
++    char                           cur_backend[32] = {0};
++    // system sampling at dump time
++    int                            sys_ms       = 500;
++    int64_t                        sys_last_us  = 0;
++    uint64_t                       sys_idx      = 0;
++    std::vector<std::pair<std::string, std::string>> sys_files; // key, path
++};
++
++std::atomic<int> g_hprof_enabled{-1}; // -1 not initialised, 0 off (or stopped), 1 recording
++
++ggml_hprof_state & ggml_hprof_get() {
++    static ggml_hprof_state st;
++    return st;
++}
++
++void ggml_hprof_lock(ggml_hprof_state & st) {
++    while (st.lock.exchange(true, std::memory_order_acquire)) {
++    }
++}
++
++void ggml_hprof_unlock(ggml_hprof_state & st) {
++    st.lock.store(false, std::memory_order_release);
++}
++
++const char * ggml_hprof_kind_name(int kind) {
++    switch (kind) {
++        case GGML_HPROF_DECODE_BEGIN:     return "DECODE_BEGIN";
++        case GGML_HPROF_DECODE_END:       return "DECODE_END";
++        case GGML_HPROF_UBATCH_BEGIN:     return "UBATCH_BEGIN";
++        case GGML_HPROF_GRAPH_READY:      return "GRAPH_READY";
++        case GGML_HPROF_INPUTS_SET:       return "INPUTS_SET";
++        case GGML_HPROF_UBATCH_END:       return "UBATCH_END";
++        case GGML_HPROF_SCHED_BEGIN:      return "SCHED_BEGIN";
++        case GGML_HPROF_SCHED_END:        return "SCHED_END";
++        case GGML_HPROF_SPLIT_BEGIN:      return "SPLIT_BEGIN";
++        case GGML_HPROF_SPLIT_COPIED:     return "SPLIT_COPIED";
++        case GGML_HPROF_SPLIT_END:        return "SPLIT_END";
++        case GGML_HPROF_SPLIT_NODE:       return "SPLIT_NODE";
++        case GGML_HPROF_GET_TENSOR_BEGIN: return "GET_TENSOR_BEGIN";
++        case GGML_HPROF_GET_TENSOR_END:   return "GET_TENSOR_END";
++        case GGML_HPROF_SYNC_BEGIN:       return "SYNC_BEGIN";
++        case GGML_HPROF_SYNC_END:         return "SYNC_END";
++        case GGML_HPROF_HEX_SEND:         return "HEX_SEND";
++        case GGML_HPROF_HEX_RECV:         return "HEX_RECV";
++        case GGML_HPROF_HEX_WAIT_BEGIN:   return "HEX_WAIT_BEGIN";
++        case GGML_HPROF_HEX_WAIT_END:     return "HEX_WAIT_END";
++        case GGML_HPROF_NODE_DONE:        return "NODE_DONE";
++        case GGML_HPROF_SYS:              return "SYS";
++        default:                          return "UNKNOWN";
++    }
++}
++
++// read a small sysfs file into buf (without the trailing newline); false if unreadable
++bool ggml_hprof_read_small(const char * path, char * buf, size_t n) {
++    FILE * f = fopen(path, "r");
++    if (!f) {
++        return false;
++    }
++    const size_t got = fread(buf, 1, n - 1, f);
++    fclose(f);
++    buf[got] = 0;
++    for (size_t i = 0; i < got; i++) {
++        if (buf[i] == '\n' || buf[i] == '\r') {
++            buf[i] = 0;
++            break;
++        }
++    }
++    return got > 0;
++}
++
++// Build the list of sysfs files sampled at dump time (Linux/Android only).
++void ggml_hprof_sys_init(ggml_hprof_state & st) {
++#if defined(__linux__)
++    // thermal zones whose type names a part we care about (cpu clusters, nsp/cdsp, gpu, skin, ddr, soc, battery)
++    static const char * wanted[] = { "cpu", "nsp", "cdsp", "npu", "gpu", "skin", "ddr", "soc", "batt", "modem", "xo" };
++    for (int i = 0; i < 160 && st.sys_files.size() < 32; i++) {
++        char path[128];
++        char type[96];
++        snprintf(path, sizeof(path), "/sys/class/thermal/thermal_zone%d/type", i);
++        if (!ggml_hprof_read_small(path, type, sizeof(type))) {
++            if (i > 8) {
++                break; // zones are numbered contiguously
++            }
++            continue;
++        }
++        bool keep = false;
++        for (const char * w : wanted) {
++            if (strstr(type, w)) {
++                keep = true;
++                break;
++            }
++        }
++        if (!keep) {
++            continue;
++        }
++        snprintf(path, sizeof(path), "/sys/class/thermal/thermal_zone%d/temp", i);
++        st.sys_files.emplace_back(std::string("thermal:") + type, path);
++    }
++    for (int i = 0; i < 16; i++) {
++        char path[128];
++        char val[32];
++        snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpufreq/policy%d/scaling_cur_freq", i);
++        if (ggml_hprof_read_small(path, val, sizeof(val))) {
++            char key[32];
++            snprintf(key, sizeof(key), "cpufreq:policy%d", i);
++            st.sys_files.emplace_back(key, path);
++        }
++    }
++#else
++    (void) st;
++#endif
++}
++
++// Print one SYS line per sampled file (called inside the DUMP window, rate limited by sys_ms).
++void ggml_hprof_sys_sample(ggml_hprof_state & st) {
++    if (st.sys_ms <= 0 || st.sys_files.empty()) {
++        return;
++    }
++    const int64_t now = ggml_time_us();
++    if (st.sys_last_us && now - st.sys_last_us < (int64_t) st.sys_ms * 1000) {
++        return;
++    }
++    st.sys_last_us = now;
++    int cpu = -1;
++#if defined(__linux__)
++    cpu = sched_getcpu();
++#endif
++    for (const auto & kv : st.sys_files) {
++        char val[32];
++        if (!ggml_hprof_read_small(kv.second.c_str(), val, sizeof(val))) {
++            continue;
++        }
++        fprintf(stderr, "HPROF %lld SYS %llu %lld %d 0 %s\n", (long long) ggml_time_us(), (unsigned long long) st.sys_idx,
++                (long long) strtoll(val, NULL, 10), cpu, kv.first.c_str());
++    }
++    st.sys_idx++;
++}
++
++} // namespace
++
++extern "C" {
++
++int ggml_hprof_enabled(void) {
++    const int e = g_hprof_enabled.load(std::memory_order_relaxed);
++    if (e >= 0) {
++        return e;
++    }
++    static const int init = [] {
++        const char * env = getenv("GGML_HPROF");
++        const int on = (env == nullptr || atoi(env) != 0) ? 1 : 0;
++        if (on) {
++            ggml_hprof_state & st = ggml_hprof_get();
++            const char * nodes = getenv("GGML_HPROF_NODES");
++            if (nodes) {
++                st.max_split_nodes = atoi(nodes);
++            }
++            const char * maxd = getenv("GGML_HPROF_MAX_DECODES");
++            if (maxd) {
++                st.max_decodes = atoi(maxd);
++            }
++            const char * sysms = getenv("GGML_HPROF_SYS_MS");
++            if (sysms) {
++                st.sys_ms = atoi(sysms);
++            }
++            if (st.sys_ms > 0) {
++                ggml_hprof_sys_init(st);
++            }
++            st.events.reserve(1u << 16);
++            st.text.reserve(1u << 22);
++            fprintf(stderr, "HPROF %lld INIT %d %zu 0 %d ggml\n", (long long) ggml_time_us(), st.max_decodes, st.sys_files.size(), st.max_split_nodes);
++            atexit(ggml_hprof_dump);
++        }
++        g_hprof_enabled.store(on, std::memory_order_relaxed);
++        return on;
++    }();
++    return init;
++}
++
++int ggml_hprof_max_split_nodes(void) {
++    return ggml_hprof_get().max_split_nodes;
++}
++
++void ggml_hprof_set_split(int split_id, int n_nodes, const char * backend) {
++    ggml_hprof_state & st = ggml_hprof_get();
++    ggml_hprof_lock(st);
++    st.cur_split       = split_id;
++    st.cur_split_nodes = n_nodes;
++    st.cur_node_k      = 0;
++    if (backend) {
++        strncpy(st.cur_backend, backend, sizeof(st.cur_backend) - 1);
++        st.cur_backend[sizeof(st.cur_backend) - 1] = 0;
++    } else {
++        st.cur_backend[0] = 0;
++    }
++    ggml_hprof_unlock(st);
++}
++
++void ggml_hprof_node_done(void) {
++    if (!ggml_hprof_enabled()) {
++        return;
++    }
++    ggml_hprof_state & st = ggml_hprof_get();
++    ggml_hprof_lock(st);
++    const int  split = st.cur_split;
++    const int  k     = st.cur_node_k++;
++    const bool emit  = split >= 0 && st.cur_split_nodes <= st.max_split_nodes;
++    char backend[32];
++    memcpy(backend, st.cur_backend, sizeof(backend));
++    ggml_hprof_unlock(st);
++    if (emit) {
++        ggml_hprof_ev(GGML_HPROF_NODE_DONE, (uint64_t) split, (uint64_t) k, 0, 0, backend);
++    }
++}
++
++void ggml_hprof_ev(int kind, uint64_t a, uint64_t b, uint64_t c, uint64_t d, const char * name) {
++    ggml_hprof_event ev;
++    ev.t    = ggml_time_us();
++    ev.kind = kind;
++    ev.a    = a;
++    ev.b    = b;
++    ev.c    = c;
++    ev.d    = d;
++    if (name) {
++        strncpy(ev.name, name, sizeof(ev.name) - 1);
++        ev.name[sizeof(ev.name) - 1] = 0;
++    } else {
++        ev.name[0] = 0;
++    }
++
++    ggml_hprof_state & st = ggml_hprof_get();
++    ggml_hprof_lock(st);
++    if (st.events.size() < (1u << 20)) {
++        st.events.push_back(ev);
++    } else {
++        st.dropped++;
++    }
++    if (kind == GGML_HPROF_DECODE_END && st.max_decodes > 0 && ++st.n_decodes >= st.max_decodes && !st.stopped) {
++        // capture window over: stop recording (and stop the hexagon per-op lines) to bound the log
++        st.stopped = true;
++        g_hprof_enabled.store(0, std::memory_order_relaxed);
++    }
++    ggml_hprof_unlock(st);
++}
++
++void ggml_hprof_puts(const char * s, size_t len) {
++    if (!len) {
++        return;
++    }
++    if (!ggml_hprof_enabled()) {
++        if (ggml_hprof_get().stopped) {
++            return; // capture window over
++        }
++        fwrite(s, 1, len, stderr); // hprof disabled: behave like a plain fprintf(stderr)
++        return;
++    }
++
++    ggml_hprof_state & st = ggml_hprof_get();
++    ggml_hprof_lock(st);
++    if (st.text.size() + len > (64u << 20)) {
++        // buffer full: fall back to immediate output rather than losing the line
++        fwrite(st.text.data(), 1, st.text.size(), stderr);
++        st.text.clear();
++    }
++    st.text.append(s, len);
++    ggml_hprof_unlock(st);
++}
++
++void ggml_hprof_logf(const char * fmt, ...) {
++    char buf[1024];
++    va_list args;
++    va_start(args, fmt);
++    const int n = vsnprintf(buf, sizeof(buf), fmt, args);
++    va_end(args);
++    if (n <= 0) {
++        return;
++    }
++    const size_t len = (size_t) n < sizeof(buf) ? (size_t) n : sizeof(buf) - 1;
++    ggml_hprof_puts(buf, len);
++}
++
++void ggml_hprof_dump(void) {
++    ggml_hprof_state & st = ggml_hprof_get();
++
++    std::vector<ggml_hprof_event> events;
++    std::string text;
++    size_t dropped = 0;
++    bool print_stop = false;
++
++    ggml_hprof_lock(st);
++    events.swap(st.events);
++    text.swap(st.text);
++    dropped = st.dropped;
++    st.dropped = 0;
++    if (st.stopped && !st.stop_printed) {
++        st.stop_printed = true;
++        print_stop = true;
++    }
++    ggml_hprof_unlock(st);
++
++    if (events.empty() && text.empty() && !print_stop) {
++        return;
++    }
++
++    const int64_t t0 = ggml_time_us();
++    for (const ggml_hprof_event & ev : events) {
++        fprintf(stderr, "HPROF %lld %s %llu %llu %llu %llu %s\n", (long long) ev.t, ggml_hprof_kind_name(ev.kind),
++                (unsigned long long) ev.a, (unsigned long long) ev.b, (unsigned long long) ev.c, (unsigned long long) ev.d,
++                ev.name[0] ? ev.name : "-");
++    }
++    if (!text.empty()) {
++        fwrite(text.data(), 1, text.size(), stderr);
++    }
++    if (!st.stopped) {
++        ggml_hprof_sys_sample(st); // only the dumping thread calls this; st.sys_* is not touched elsewhere
++    }
++    if (print_stop) {
++        fprintf(stderr, "HPROF %lld STOP %d 0 0 0 -\n", (long long) ggml_time_us(), st.n_decodes);
++    }
++    fflush(stderr);
++    const int64_t t1 = ggml_time_us();
++    fprintf(stderr, "HPROF %lld DUMP %lld %zu %zu %zu -\n", (long long) t0, (long long) t1, events.size(), text.size(), dropped);
++
++    // hand the (cleared) buffers back so that no reallocation happens during the next window
++    events.clear();
++    text.clear();
++    ggml_hprof_lock(st);
++    if (st.events.capacity() < events.capacity()) {
++        st.events.swap(events);
++    }
++    if (st.text.capacity() < text.capacity()) {
++        st.text.swap(text);
++    }
++    ggml_hprof_unlock(st);
++}
++
++} // extern "C"
++
+ 
+ // backend buffer type
+ 
+@@ -2208,11 +2587,32 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+ 
+     int prev_backend_id = -1;
+ 
++    GGML_HPROF_EV(GGML_HPROF_SCHED_BEGIN, sched->n_splits, 0, 0, 0, NULL);
++
+     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
+         struct ggml_backend_sched_split * split = &splits[split_id];
+         int split_backend_id = split->backend_id;
+         ggml_backend_t split_backend = sched->backends[split_backend_id];
+ 
++        size_t hprof_in_bytes = 0;
++        GGML_HPROF_EV(GGML_HPROF_SPLIT_BEGIN, split_id, split_backend_id, split->graph.n_nodes, split->n_inputs, ggml_backend_name(split_backend));
++        if (ggml_hprof_enabled()) {
++            ggml_hprof_set_split(split_id, split->graph.n_nodes, ggml_backend_name(split_backend));
++        }
++        if (ggml_hprof_enabled() && split->graph.n_nodes <= ggml_hprof_max_split_nodes()) {
++            for (int j = 0; j < split->graph.n_nodes; j++) {
++                const struct ggml_tensor * node = split->graph.nodes[j];
++                const struct ggml_tensor * s0 = node->src[0];
++                const struct ggml_tensor * s1 = node->src[1];
++                char desc[160];
++                snprintf(desc, sizeof(desc), "%s %s %s<-%s,%s %lldx%lldx%lld %lldx%lldx%lld", ggml_op_name(node->op), node->name,
++                         ggml_type_name(node->type), s0 ? ggml_type_name(s0->type) : "-", s1 ? ggml_type_name(s1->type) : "-",
++                         s0 ? (long long) s0->ne[0] : 0, s0 ? (long long) s0->ne[1] : 0, s0 ? (long long) s0->ne[2] : 0,
++                         s1 ? (long long) s1->ne[0] : 0, s1 ? (long long) s1->ne[1] : 0, s1 ? (long long) s1->ne[2] : 0);
++                ggml_hprof_ev(GGML_HPROF_SPLIT_NODE, split_id, node->op, node->ne[0], node->ne[1], desc);
++            }
++        }
++
+         // ensure the previous split's async work has completed before we start
+         // this split, the allocator may have reused buffer regions across splits
+         if (split->n_inputs == 0 && prev_backend_id >= 0 && prev_backend_id != split_backend_id) {
+@@ -2228,6 +2628,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
+             struct ggml_tensor * input = split->inputs[input_id];
+             if (!ggml_backend_sched_is_host_weight(input) && sched->hv_tensor_requires_copy[hash_id(input)]) {
++                hprof_in_bytes += ggml_nbytes(input);
+                 ggml_backend_sched_copy_input(sched, split, input);
+             }
+         }
+@@ -2237,10 +2638,13 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
+             struct ggml_tensor * input = split->inputs[input_id];
+             if (ggml_backend_sched_is_host_weight(input) && sched->hv_tensor_requires_copy[hash_id(input)]) {
++                hprof_in_bytes += ggml_nbytes(input);
+                 ggml_backend_sched_copy_input(sched, split, input);
+             }
+         }
+ 
++        GGML_HPROF_EV(GGML_HPROF_SPLIT_COPIED, split_id, 0, hprof_in_bytes, 0, NULL);
++
+         if (!sched->callback_eval) {
+             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
+             if (ec != GGML_STATUS_SUCCESS) {
+@@ -2280,6 +2684,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+             }
+         }
+ 
++        GGML_HPROF_EV(GGML_HPROF_SPLIT_END, split_id, 0, 0, 0, NULL);
++
+         // record the event of this split
+         if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
+             ggml_backend_event_record(sched->events[split_backend_id][sched->cur_copy], split_backend);
+@@ -2288,6 +2694,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+         prev_backend_id = split_backend_id;
+     }
+ 
++    GGML_HPROF_MARK(GGML_HPROF_SCHED_END);
++
+     return GGML_STATUS_SUCCESS;
+ }
+ 
+diff --git a/ggml/src/ggml-hexagon/ggml-hexagon.cpp b/ggml/src/ggml-hexagon/ggml-hexagon.cpp
+index 7dadf6a41..b4f5b070e 100644
+--- a/ggml/src/ggml-hexagon/ggml-hexagon.cpp
++++ b/ggml/src/ggml-hexagon/ggml-hexagon.cpp
+@@ -53,6 +53,7 @@
+ #include "ggml-common.h"
+ #include "ggml-hexagon.h"
+ #include "ggml-impl.h"
++#include "ggml-hprof.h"
+ #include "ggml-quants.h"
+ #include "htp-opnode.h"
+ #include "htp/htp-ops.h"
+@@ -153,6 +154,11 @@ int    opt_opqueue   = 8;    // max number of pending batches
+ int    opt_optrace   = 0;    // trace buffer size per thread (0 means default)
+ int    opt_oppoll    = 0;    // polling for batch completions
+ int    opt_opfusion  = 1;    // enable/disable op fusion
++// hprof: mode-3 trace op filter (GGML_HEXAGON_OPTRACE_OPS). Comma-separated, case-insensitive substrings of the
++// op name (MUL_MAT_NX, SSM_CONV, GATED_DELTA_NET, ...) or of the dst tensor name. Only matching ops record trace
++// events on the DSP; empty = all ops.
++static const char * opt_optrace_ops = "";
++static std::vector<std::string> opt_optrace_ops_list;
+ int    opt_rt_repack = 1;    // runtime repacking: 0 = disabled, 1 = all tileable weights (default)
+ 
+ static std::regex* opt_opfilter = NULL; // regex of ops to not claim
+@@ -244,7 +250,7 @@ static void ggml_hexagon_dump_op_prof(const char * sess_name, const htp_opnode &
+     }
+ 
+     float mhz = op_usec > 0 ? (float) op_cycles / op_usec : 0.0f;
+-    GGML_LOG_DEBUG("ggml-hex: %s profile-op %s|usec %u cycles %u start %u mhz %.1f%s\n",
++    ggml_hprof_logf("ggml-hex: %s profile-op %s|usec %u cycles %u start %u mhz %.1f%s\n",
+                    sess_name, htp_format_op(node, HTP_OPFMT_PROF).c_str(), op_usec, op_cycles, pd.cycles_start, mhz, pmu_str);
+ }
+ 
+@@ -261,26 +267,106 @@ static void ggml_hexagon_dump_batch_prof(const char * sess_name, const htp_opbat
+                 rsp.n_traces[8], rsp.n_traces[9]);
+     }
+ 
+-    GGML_LOG_DEBUG("ggml-hex: %s profile-op OPBATCH|----|n-ops %u|%s|----|----|usec %u cycles %llu start %llu mhz %.1f\n",
+-                   sess_name, rsp.n_ops, evt_str, rsp.usecs, (unsigned long long) batch_cycles, (unsigned long long) rsp.cycles_start, batch_mhz);
++    ggml_hprof_logf("ggml-hex: %s profile-op OPBATCH|----|n-ops %u|%s|----|----|usec %u cycles %llu start %llu mhz %.1f qt %llu acq %u wake %u\n",
++                   sess_name, rsp.n_ops, evt_str, rsp.usecs, (unsigned long long) batch_cycles, (unsigned long long) rsp.cycles_start, batch_mhz,
++                   (unsigned long long) rsp.qt_start, rsp.n_vtcm_acq, rsp.n_wakeups);
++}
++
++// hprof: compact mode-3 trace output. One "trace-ids" legend line per process (event id -> name), then per
++// batch and thread "trace-blk thread T n N: id,info,cycles ..." with the raw 16-bit info (bit 15 = stop),
++// at most 2048 events per line. Built without printf: ~40 ns per event instead of ~2 us.
++static inline void ggml_hprof_append_u32(std::string & s, uint32_t v) {
++    char tmp[12];
++    int  n = 0;
++    do {
++        tmp[n++] = (char) ('0' + v % 10);
++        v /= 10;
++    } while (v);
++    while (n) {
++        s.push_back(tmp[--n]);
++    }
+ }
+ 
+ static void ggml_hexagon_dump_trace_events(const char * sess_name, const htp_opbatch_rsp & rsp,
+                                            const htp_trace_desc * trace_events, uint32_t n_threads, uint32_t n_traces) {
+-    if (opt_profile == 3 && trace_events) {
+-        for (uint32_t t = 0; t < n_threads; t++) {
+-            uint32_t count = std::min(rsp.n_traces[t], n_traces);
+-            for (uint32_t idx = 0; idx < count; idx++) {
+-                const auto & e = trace_events[t * n_traces + idx];
+-                bool is_stop = (e.info & 0x8000) != 0;
+-                uint16_t info = e.info & 0x7FFF;
+-                GGML_LOG_DEBUG("ggml-hex: %s trace-evt %s: thread %u info %u %s %u\n",
+-                               sess_name, htp_event_name(e.id), t, info, is_stop ? "stop" : "start", e.cycles);
++    if (opt_profile != 3 || !trace_events) {
++        return;
++    }
++    static bool legend_done = false;
++    if (!legend_done) {
++        legend_done = true;
++        std::string s = std::string("ggml-hex: ") + sess_name + " trace-ids";
++        for (uint32_t id = 0; id < 64; id++) {
++            const char * nm = htp_event_name((uint16_t) id);
++            if (strcmp(nm, "UNKNOWN") == 0) {
++                continue;
++            }
++            s += ' ';
++            s += nm;
++            s += '=';
++            ggml_hprof_append_u32(s, id);
++        }
++        s += '\n';
++        ggml_hprof_puts(s.data(), s.size());
++    }
++
++    const uint32_t per_line = 2048;
++    std::string s;
++    s.reserve(per_line * 24 + 128);
++    for (uint32_t t = 0; t < n_threads; t++) {
++        uint32_t count = std::min(rsp.n_traces[t], n_traces);
++        const htp_trace_desc * ev = trace_events + (size_t) t * n_traces;
++        for (uint32_t idx = 0; idx < count; idx += per_line) {
++            const uint32_t n = (count - idx) < per_line ? (count - idx) : per_line;
++            s.clear();
++            s += "ggml-hex: ";
++            s += sess_name;
++            s += " trace-blk thread ";
++            ggml_hprof_append_u32(s, t);
++            s += " n ";
++            ggml_hprof_append_u32(s, n);
++            s += ':';
++            for (uint32_t k = 0; k < n; k++) {
++                const auto & e = ev[idx + k];
++                s += ' ';
++                ggml_hprof_append_u32(s, e.id);
++                s += ',';
++                ggml_hprof_append_u32(s, e.info);
++                s += ',';
++                ggml_hprof_append_u32(s, e.cycles);
+             }
++            s += '\n';
++            ggml_hprof_puts(s.data(), s.size());
++        }
++    }
++}
++
++// hprof: ASCII lower-casing without <cctype>
++static inline void ggml_hprof_lower(std::string & s) {
++    for (auto & c : s) {
++        if (c >= 'A' && c <= 'Z') {
++            c = (char) (c - 'A' + 'a');
+         }
+     }
+ }
+ 
++// hprof: does this op record mode-3 trace events? (see opt_optrace_ops)
++static bool ggml_hexagon_optrace_match(const htp_opnode & node) {
++    if (opt_optrace_ops_list.empty()) {
++        return true;
++    }
++    std::string op = htp_format_op(node, HTP_OPFMT_PROF);
++    std::string tn = node.node ? node.node->name : "";
++    ggml_hprof_lower(op);
++    ggml_hprof_lower(tn);
++    for (const auto & pat : opt_optrace_ops_list) {
++        if (op.find(pat) != std::string::npos || (!tn.empty() && tn.find(pat) != std::string::npos)) {
++            return true;
++        }
++    }
++    return false;
++}
++
+ // ** backend sessions
+ 
+ struct ggml_hexagon_opbatch;
+@@ -1467,6 +1553,9 @@ struct ggml_hexagon_opbatch {
+ 
+         ops[n] = node;
+         h_ops[n].flags = 0;
++        if (opt_profile == 3 && ggml_hexagon_optrace_match(ops[n])) {
++            h_ops[n].flags |= HTP_OPFLAGS_TRACE; // hprof: this op records mode-3 trace events
++        }
+ 
+         ggml_hexagon_dump_op_exec(sess->c_name(), ops[n], h_ops[n].flags);
+         sync_op_desc(n);
+@@ -1543,6 +1632,7 @@ struct ggml_hexagon_opqueue {
+     ggml_hexagon_shared_buffer *shm_buf;
+     size_t                      shm_blk_size;
+     size_t                      depth;
++    std::vector<uint64_t>       start_usec; // hprof: ggml_time_us() at push, per slot ((seq - 1) % depth)
+ 
+     using opvec = std::vector<htp_opnode>;
+ 
+@@ -1567,6 +1657,7 @@ struct ggml_hexagon_opqueue {
+         shm_buf = new ggml_hexagon_shared_buffer(sess, shm_blk_size * depth, true /* pinned */);
+ 
+         op_cache.resize(depth);
++        start_usec.assign(depth, 0);
+ 
+         if (opt_verbose) {
+             GGML_LOG_INFO("ggml-hex: %s allocated opqueue : batch-size %zu depth %zu shm-size %zu shm-block-size %zu\n",
+@@ -1592,6 +1683,7 @@ struct ggml_hexagon_opqueue {
+         if (seq - shm_buf->sess->batch_rsp_seq > depth) { return false; }
+ 
+         const uint32_t slot = (uint32_t) ((seq - 1) % depth);
++        start_usec[slot] = (uint64_t) ggml_time_us();
+ 
+         req.seq       = seq;
+         req.n_bufs    = op_batch->n_bufs;
+@@ -1730,6 +1822,11 @@ void ggml_hexagon_session::flush_pending(bool all) {
+         }
+     }
+ 
++    const uint64_t hprof_pending = (uint64_t) this->batch_req_seq - (uint64_t) this->batch_rsp_seq;
++    if (hprof_pending) {
++        GGML_HPROF_EV(GGML_HPROF_HEX_WAIT_BEGIN, hprof_pending, 0, 0, 0, this->c_name());
++    }
++
+     while (this->batch_rsp_seq < this->batch_req_seq) {
+         struct htp_opbatch_rsp rsp;
+         uint32_t               rsp_size;
+@@ -1765,11 +1862,20 @@ void ggml_hexagon_session::flush_pending(bool all) {
+ 
+         op_queue->pop(rsp, dbuf);
+ 
++        if (ggml_hprof_enabled()) {
++            const uint64_t t_push = op_queue->start_usec[(size_t) ((rsp.seq - 1) % op_queue->depth)];
++            ggml_hprof_ev(GGML_HPROF_HEX_RECV, rsp.seq, rsp.n_ops, rsp.usecs, (uint64_t) ggml_time_us() - t_push, this->c_name());
++        }
++
+         GGML_ASSERT(rsp.seq == this->batch_rsp_seq + 1);
+         this->batch_rsp_seq = rsp.seq;
+ 
+         if (!all) break;
+     }
++
++    if (hprof_pending) {
++        GGML_HPROF_EV(GGML_HPROF_HEX_WAIT_END, hprof_pending, 0, 0, 0, this->c_name());
++    }
+ }
+ 
+ void ggml_hexagon_session::flush_sync(bool all) {
+@@ -1827,6 +1933,8 @@ void ggml_hexagon_session::flush_batch(size_t min_ops) {
+         GGML_ABORT("ggml-hex: %s dspqueue_write failed: 0x%08x\n", this->c_name(), (unsigned) err);
+     }
+ 
++    GGML_HPROF_EV(GGML_HPROF_HEX_SEND, seq, req.n_ops, dbuf.size, 0, this->c_name());
++
+     op_batch->reset();
+ }
+ 
+@@ -3880,6 +3988,25 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
+     opt_opbatch   = str_opbatch  ? strtoul(str_opbatch, NULL, 0)          : opt_opbatch;
+     opt_opqueue   = str_opqueue  ? strtoul(str_opqueue, NULL, 0)          : opt_opqueue;
+     opt_optrace   = str_optrace  ? strtoul(str_optrace, NULL, 0)          : (opt_opbatch * HTP_TRACE_MAX_EVENTS + 131072);
++    {
++        // hprof: mode-3 trace op filter -> lower-cased substring list
++        const char * str_optrace_ops = getenv("GGML_HEXAGON_OPTRACE_OPS");
++        const char * ops_str = str_optrace_ops ? str_optrace_ops : opt_optrace_ops;
++        opt_optrace_ops_list.clear();
++        std::string cur;
++        for (const char * p = ops_str; ; p++) {
++            if (*p == ',' || *p == '\0') {
++                if (!cur.empty()) { ggml_hprof_lower(cur); opt_optrace_ops_list.push_back(cur); }
++                cur.clear();
++                if (*p == '\0') { break; }
++            } else if (*p != ' ') {
++                cur.push_back(*p);
++            }
++        }
++        if (!opt_optrace_ops_list.empty()) {
++            GGML_LOG_INFO("ggml-hex: hprof mode-3 trace op filter: %s\n", ops_str);
++        }
++    }
+     opt_oppoll    = str_oppoll   ? strtoul(str_oppoll,  NULL, 0)          : opt_oppoll;
+     opt_opfusion  = str_opfusion ? atoi(str_opfusion)                     : opt_opfusion;
+     opt_rt_repack = str_rt_repack ? atoi(str_rt_repack)                   : opt_rt_repack;
+@@ -3927,6 +4054,14 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
+     opt_vmem    = str_vmem    ? parse_size(str_vmem)   : opt_vmem;
+     opt_hostbuf = str_hostbuf ? atoi(str_hostbuf) != 0 : opt_hostbuf;
+ 
++    // hprof-ops diagnostic build: the device harness cannot pass environment variables, so basic per-op
++    // profiling (mode 1) is on whenever hprof is recording and GGML_HEXAGON_PROFILE is unset.
++    if (!str_profile && ggml_hprof_enabled()) {
++        opt_profile = 1;
++        GGML_LOG_INFO("ggml-hex: Profiling mode %u : pmu-evt [ %s ]\n", opt_profile,
++                      vec_to_str<uint32_t, 16>(opt_pmu_evt).c_str());
++    }
++
+     // Parse device configuration
+     const char * str_devices  = getenv("GGML_HEXAGON_DEVICES");
+     if (!str_devices && str_ndev && str_ndev[0] != '\0') {
+diff --git a/ggml/src/ggml-hexagon/htp/htp-ctx.h b/ggml/src/ggml-hexagon/htp/htp-ctx.h
+index 2e47ac3ff..1d022ea89 100644
+--- a/ggml/src/ggml-hexagon/htp/htp-ctx.h
++++ b/ggml/src/ggml-hexagon/htp/htp-ctx.h
+@@ -104,6 +104,8 @@ struct htp_context {
+     uint32_t               vtcm_rctx;
+     atomic_bool            vtcm_valid;
+     atomic_bool            vtcm_needs_release;
++    uint32_t               n_vtcm_acq;         // hprof: VTCM acquire count
++    uint32_t               n_wakeups;          // hprof: process_ops entry count
+ 
+     uint64_t               max_vmem;
+     uint32_t               mmap_inuse;         // x-elite port (cand. A): mappings used by the batch being computed
+diff --git a/ggml/src/ggml-hexagon/htp/htp-ops.h b/ggml/src/ggml-hexagon/htp/htp-ops.h
+index b7f40a729..726c11cf8 100644
+--- a/ggml/src/ggml-hexagon/htp/htp-ops.h
++++ b/ggml/src/ggml-hexagon/htp/htp-ops.h
+@@ -191,6 +191,7 @@ struct htp_buf_desc {
+ 
+ enum htp_op_flags {
+     HTP_OPFLAGS_STUB  = (1U << 0),
++    HTP_OPFLAGS_TRACE = (1U << 1), // hprof: record mode-3 trace events for this op (host-side op filter)
+ };
+ 
+ // Op descriptor
+@@ -310,6 +311,9 @@ struct htp_opbatch_rsp {
+     uint32_t n_tensors;      // Number of tensors
+     uint32_t n_ops;          // Number of op profile descriptors
+     uint32_t usecs;          // Number of usec
++    uint64_t qt_start;       // hprof: QTimer count at batch start (19.2 MHz SoC time base, same clock as usecs)
++    uint32_t n_vtcm_acq;     // hprof: VTCM acquires so far in this session
++    uint32_t n_wakeups;      // hprof: process_ops entries so far
+     uint32_t n_traces[HTP_OP_MAX_NTHREADS];
+     // struct htp_prof_desc profs[];  -- dspqueue buf 0
+ };
+diff --git a/ggml/src/ggml-hexagon/htp/main.c b/ggml/src/ggml-hexagon/htp/main.c
+index 04bddf710..785b4f787 100644
+--- a/ggml/src/ggml-hexagon/htp/main.c
++++ b/ggml/src/ggml-hexagon/htp/main.c
+@@ -297,6 +297,7 @@ static void vtcm_acquire(struct htp_context * ctx) {
+ 
+         atomic_store(&ctx->vtcm_needs_release, false);
+         atomic_store(&ctx->vtcm_valid, true);
++        ctx->n_vtcm_acq++;
+ 
+         // Drop the priority to make sure we get the release callback from other GGML-HTP and QNN-HTP sessions
+         HAP_compute_res_update_priority(ctx->vtcm_rctx, ctx->thread_prio + 10);
+@@ -1409,12 +1410,26 @@ static void process_opbatch(struct htp_context * ctx, const struct htp_opbatch_r
+     for (uint32_t i = 0; i < n_ops; i++) {
+         struct profile_data prof;
+ 
++        // hprof: mode-3 op filter. Ops without HTP_OPFLAGS_TRACE record no trace events (buffers stay allocated).
++        const int tr_off = (ctx->profiler == HTP_PROF_TRACE) && !(ops[i].flags & HTP_OPFLAGS_TRACE);
++        if (tr_off) {
++            for (int t = 0; t <= HTP_MAX_NTHREADS; t++) {
++                ctx->trace[t].max_events = 0;
++            }
++        }
++
+         profile_start(ctx->profiler, &prof);
+ 
+         op_status = proc_op_req(octx, bufs, n_bufs, tens, i, &ops[i]);
+ 
+         profile_stop(ctx->profiler, &prof);
+ 
++        if (tr_off) {
++            for (int t = 0; t <= HTP_MAX_NTHREADS; t++) {
++                ctx->trace[t].max_events = req->n_traces;
++            }
++        }
++
+         htp_ops_context_set_status(octx, op_status);
+ 
+         if (ctx->profiler) {
+@@ -1441,6 +1456,7 @@ static void process_opbatch(struct htp_context * ctx, const struct htp_opbatch_r
+ 
+     htp_mdev_group_barrier(octx);
+ 
++    const uint64_t batch_qt_start = batch_prof.usecs; // raw QTimer count at batch start, before profile_stop converts it
+     profile_stop(HTP_PROF_BASIC, &batch_prof);
+ 
+     struct htp_opbatch_rsp rsp;
+@@ -1453,6 +1469,9 @@ static void process_opbatch(struct htp_context * ctx, const struct htp_opbatch_r
+     rsp.usecs        = batch_prof.usecs;
+     rsp.cycles_start = batch_prof.cycles_start;
+     rsp.cycles_stop  = batch_prof.cycles_stop;
++    rsp.qt_start     = batch_qt_start;
++    rsp.n_vtcm_acq   = ctx->n_vtcm_acq;
++    rsp.n_wakeups    = ctx->n_wakeups;
+ 
+     if (ctx->profiler == HTP_PROF_TRACE) {
+         for (uint32_t t = 0; t < ctx->n_threads; t++) {
+@@ -1499,6 +1518,7 @@ static void process_ops(struct htp_context * ctx) {
+     uint32_t poll_count = DSPQUEUE_POLL_COUNT;
+ 
+     vtcm_acquire(ctx);
++    ctx->n_wakeups++;
+ 
+     struct htp_opbatch_req  next_req;
+     struct dspqueue_buffer  next_dbuf;
+diff --git a/ggml/src/ggml-hprof.h b/ggml/src/ggml-hprof.h
+new file mode 100644
+index 000000000..7fe1f74c9
+--- /dev/null
++++ b/ggml/src/ggml-hprof.h
+@@ -0,0 +1,99 @@
++// ggml-hprof.h -- host-side end-to-end timeline for llama.cpp inference (diagnostic builds only).
++//
++// Records timestamped events from llama_decode, the backend scheduler and the Hexagon backend
++// into an in-memory buffer and prints them to stderr only at dump points (end of llama_decode,
++// end of llama_context::synchronize, process exit), so that printing does not perturb the
++// measured window. The hexagon per-op profile lines are routed through the same buffer.
++//
++// Every line is prefixed with "HPROF " and parsed by profiler/hprof_parse.py.
++//
++// Environment:
++//   GGML_HPROF=0              disable (default: enabled -- diagnostic builds cannot receive env vars
++//                             through the device harness, so the patch is on by default)
++//   GGML_HPROF_NODES=N        list the nodes of splits with at most N nodes (default 16)
++//   GGML_HPROF_MAX_DECODES=N  stop recording after N llama_decode calls (default 512; bounds the log,
++//                             a decode call costs ~10 KB of host events, ~120 KB more with DSP per-op lines)
++//   GGML_HPROF_SYS_MS=N       at most every N ms, write SYS samples at dump time (Linux: thermal zones of
++//                             interest in m°C, cpufreq policies in kHz, cpu of the dumping thread); 0 disables
++//                             (default 500). The samples are taken inside the DUMP window so the parser
++//                             subtracts their cost.
++//
++// Per-node timing of small CPU splits: the scheduler tells hprof which split is running
++// (ggml_hprof_set_split) and llama-context installs a CPU abort-callback wrapper that calls
++// ggml_hprof_node_done after every computed node; for splits with at most GGML_HPROF_NODES nodes this
++// yields one NODE_DONE event per node, i.e. the per-op compute time of the CPU islands.
++
++#pragma once
++
++#include <stdint.h>
++#include <stddef.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++#include "ggml.h"
++// GGML_API: dllexport inside ggml-base (GGML_BUILD), dllimport in the backend and llama DLLs on Windows,
++// visibility("default") elsewhere. The hprof state lives in ggml-base (ggml-backend.cpp); the hexagon
++// backend and llama link against it.
++#define GGML_HPROF_API GGML_API
++
++enum ggml_hprof_kind {
++    GGML_HPROF_DECODE_BEGIN     = 1,  // a = n_tokens
++    GGML_HPROF_DECODE_END       = 2,  // a = return code
++    GGML_HPROF_UBATCH_BEGIN     = 3,  // a = n_tokens
++    GGML_HPROF_GRAPH_READY      = 4,  // a = 1 if the previous graph was reused, 0 if rebuilt + allocated
++    GGML_HPROF_INPUTS_SET       = 5,  // set_inputs done
++    GGML_HPROF_UBATCH_END       = 6,  // graph_compute returned, a = status
++    GGML_HPROF_SCHED_BEGIN      = 7,  // a = n_splits
++    GGML_HPROF_SCHED_END        = 8,
++    GGML_HPROF_SPLIT_BEGIN      = 9,  // a = split, b = backend id, c = n_nodes, d = n_inputs, name = backend
++    GGML_HPROF_SPLIT_COPIED     = 10, // a = split, c = input bytes copied (waits for other backends happen here)
++    GGML_HPROF_SPLIT_END        = 11, // a = split, graph_compute_async returned
++    GGML_HPROF_SPLIT_NODE       = 12, // a = split, b = ggml_op, c = ne0, d = ne1, name = "OP tensor dst<-src0,src1 ne(src0) ne(src1)" (small splits only)
++    GGML_HPROF_GET_TENSOR_BEGIN = 13, // c = bytes, name = what
++    GGML_HPROF_GET_TENSOR_END   = 14, // name = what
++    GGML_HPROF_SYNC_BEGIN       = 15, // llama_context::synchronize
++    GGML_HPROF_SYNC_END         = 16,
++    GGML_HPROF_HEX_SEND         = 17, // a = batch seq, b = n_ops, c = request bytes, name = session
++    GGML_HPROF_HEX_RECV         = 18, // a = batch seq, b = n_ops, c = DSP usec, d = host usec since push, name = session
++    GGML_HPROF_HEX_WAIT_BEGIN   = 19, // flush_pending entry, a = batches pending, name = session
++    GGML_HPROF_HEX_WAIT_END     = 20, // a = batches received
++    GGML_HPROF_NODE_DONE        = 21, // a = split, b = index of the computed node within the split, name = backend (small splits only)
++    GGML_HPROF_SYS              = 22, // a = sample index, b = value, c = cpu of the sampling thread, name = key ("thermal:<type>", "cpufreq:policyN")
++};
++
++// 1 when enabled. Cheap after the first call.
++GGML_HPROF_API int  ggml_hprof_enabled(void);
++
++// Record an event with the current ggml_time_us() timestamp. name may be NULL.
++GGML_HPROF_API void ggml_hprof_ev(int kind, uint64_t a, uint64_t b, uint64_t c, uint64_t d, const char * name);
++
++// Append a formatted text line to the buffer (used for the hexagon per-op profile lines).
++GGML_HPROF_API void ggml_hprof_logf(const char * fmt, ...);
++
++// Append len bytes of preformatted text (same buffering rules as ggml_hprof_logf; used for the
++// compact mode-3 trace lines, which are built without printf).
++GGML_HPROF_API void ggml_hprof_puts(const char * s, size_t len);
++
++// Print everything buffered so far to stderr and clear the buffer.
++GGML_HPROF_API void ggml_hprof_dump(void);
++
++// Maximum number of nodes for which SPLIT_NODE events are emitted.
++GGML_HPROF_API int  ggml_hprof_max_split_nodes(void);
++
++// Scheduler: the split that is about to be computed (enables NODE_DONE for small splits). backend may be NULL.
++GGML_HPROF_API void ggml_hprof_set_split(int split_id, int n_nodes, const char * backend);
++
++// Backend hook (CPU abort callback): one computed node of the current split finished.
++GGML_HPROF_API void ggml_hprof_node_done(void);
++
++#ifdef __cplusplus
++}
++#endif
++
++// Convenience macros: no-ops when disabled, one branch otherwise.
++#define GGML_HPROF_EV(kind, a, b, c, d, name) \
++    do { if (ggml_hprof_enabled()) { ggml_hprof_ev((kind), (uint64_t) (a), (uint64_t) (b), (uint64_t) (c), (uint64_t) (d), (name)); } } while (0)
++
++#define GGML_HPROF_MARK(kind) GGML_HPROF_EV((kind), 0, 0, 0, 0, NULL)
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 12db2068e..d021c900f 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -1,6 +1,7 @@
+ #include "llama-context.h"
+ 
+ #include "ggml.h"
++#include "../ggml/src/ggml-hprof.h"
+ #include "llama-arch.h"
+ #include "llama-graph.h"
+ #include "llama-impl.h"
+@@ -23,6 +24,32 @@
+ #include <string>
+ #include <unordered_map>
+ 
++#if defined(__linux__)
++#include <sched.h>
++#endif
++
++// hprof: set while llama_decode is executing so that synchronize() does not dump inside the window
++static int g_hprof_in_decode = 0;
++
++// hprof: the CPU backend calls its abort callback after every computed node (thread 0, before the
++// barrier); wrapping the user's callback gives per-node timestamps for the small CPU splits (islands)
++static bool (*g_hprof_user_abort_cb)(void *) = nullptr;
++static void * g_hprof_user_abort_data        = nullptr;
++
++static bool llama_hprof_abort_callback(void * data) {
++    (void) data;
++    ggml_hprof_node_done();
++    return g_hprof_user_abort_cb ? g_hprof_user_abort_cb(g_hprof_user_abort_data) : false;
++}
++
++static int llama_hprof_current_cpu() {
++#if defined(__linux__)
++    return sched_getcpu();
++#else
++    return -1;
++#endif
++}
++
+ //
+ // llama_context
+ //
+@@ -958,7 +985,12 @@ void llama_context::synchronize() {
+         return;
+     }
+ 
++    GGML_HPROF_MARK(GGML_HPROF_SYNC_BEGIN);
+     ggml_backend_sched_synchronize(sched.get());
++    GGML_HPROF_MARK(GGML_HPROF_SYNC_END);
++    if (!g_hprof_in_decode) {
++        ggml_hprof_dump();
++    }
+ 
+     // FIXME: if multiple single tokens are evaluated without a synchronization,
+     // the stats will be added to the prompt evaluation stats
+@@ -1392,12 +1424,20 @@ void llama_context::set_abort_callback(bool (*abort_callback)(void * data), void
+     this->abort_callback      = abort_callback;
+     this->abort_callback_data = abort_callback_data;
+ 
++    // hprof: install the per-node hook on the CPU backend (other backends keep the user's callback)
++    g_hprof_user_abort_cb   = abort_callback;
++    g_hprof_user_abort_data = abort_callback_data;
++
+     for (auto & backend : backends) {
+         auto * reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend.get()));
+         if (reg) {
+             auto * set_abort_callback_fn = (ggml_backend_set_abort_callback_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_abort_callback");
+             if (set_abort_callback_fn) {
+-                set_abort_callback_fn(backend.get(), this->abort_callback, this->abort_callback_data);
++                if (ggml_hprof_enabled() && strcmp(ggml_backend_name(backend.get()), "CPU") == 0) {
++                    set_abort_callback_fn(backend.get(), llama_hprof_abort_callback, nullptr);
++                } else {
++                    set_abort_callback_fn(backend.get(), this->abort_callback, this->abort_callback_data);
++                }
+             }
+         }
+     }
+@@ -1837,6 +1877,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
+     const auto gparams = graph_params(res, ubatch, mctx, gtype);
+ 
++    GGML_HPROF_EV(GGML_HPROF_UBATCH_BEGIN, ubatch.n_tokens, 0, 0, 0, NULL);
++    bool hprof_reused = false;
++
+     if (!graph_reuse_disable && gf_res_prev_active == res && res->can_reuse(gparams)) {
+         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
+ 
+@@ -1848,6 +1891,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+         }
+ 
+         n_reused++;
++        hprof_reused = true;
+     } else {
+         gf_res_prev_active = nullptr;
+         res->reset();
+@@ -1876,6 +1920,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+         gf_res_prev_active = res;
+     }
+ 
++    GGML_HPROF_EV(GGML_HPROF_GRAPH_READY, hprof_reused ? 1 : 0, 0, 0, 0, NULL);
++
+     // set the input data for the input tensors
+     {
+         //const auto t_start_us = ggml_time_us();
+@@ -1886,7 +1932,12 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
+     }
+ 
++    GGML_HPROF_MARK(GGML_HPROF_INPUTS_SET);
++
+     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
++
++    GGML_HPROF_EV(GGML_HPROF_UBATCH_END, (uint32_t) status, 0, 0, 0, NULL);
++
+     if (status != GGML_STATUS_SUCCESS) {
+         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
+         ret = status;
+@@ -2430,7 +2481,9 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
+             if (n_outputs) {
+                 GGML_ASSERT( n_outputs_prev + n_outputs <= n_outputs_all);
+                 GGML_ASSERT((n_outputs_prev + n_outputs)*n_vocab <= (int64_t) logits.size);
++                GGML_HPROF_EV(GGML_HPROF_GET_TENSOR_BEGIN, 0, 0, n_outputs*n_vocab*sizeof(float), 0, "logits");
+                 ggml_backend_tensor_get_async(backend_res, t_logits, logits_out, 0, n_outputs*n_vocab*sizeof(float));
++                GGML_HPROF_EV(GGML_HPROF_GET_TENSOR_END, 0, 0, 0, 0, "logits");
+             }
+         }
+ 
+@@ -2528,11 +2581,15 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
+         if (has_samplers) {
+             const auto stride = n_vocab;
+ 
++            GGML_HPROF_EV(GGML_HPROF_GET_TENSOR_BEGIN, 0, 0, 0, 0, "sampling");
++
+             // async copy the sampling data from the backend to the host
+             copy_tensor_async_rows(res->t_sampled,        sampling.sampled,    1,      n_outputs_prev, sched.get());
+             copy_tensor_async_rows(res->t_sampled_logits, sampling.logits,     stride, n_outputs_prev, sched.get(), &sampling.logits_count);
+             copy_tensor_async_rows(res->t_sampled_probs,  sampling.probs,      stride, n_outputs_prev, sched.get(), &sampling.probs_count);
+             copy_tensor_async_rows(res->t_candidates,     sampling.candidates, stride, n_outputs_prev, sched.get(), &sampling.candidates_count);
++
++            GGML_HPROF_EV(GGML_HPROF_GET_TENSOR_END, 0, 0, 0, 0, "sampling");
+         }
+ 
+         n_outputs_prev += n_outputs;
+@@ -5136,7 +5193,12 @@ int32_t llama_encode(
+ int32_t llama_decode(
+         llama_context * ctx,
+           llama_batch   batch) {
++    GGML_HPROF_EV(GGML_HPROF_DECODE_BEGIN, batch.n_tokens, (uint32_t) llama_hprof_current_cpu(), 0, 0, NULL);
++    g_hprof_in_decode = 1;
+     const int ret = ctx->decode(batch);
++    g_hprof_in_decode = 0;
++    GGML_HPROF_EV(GGML_HPROF_DECODE_END, (uint32_t) ret, 0, 0, 0, NULL);
++    ggml_hprof_dump();
+     if (ret != 0 && ret != 1) {
+         LLAMA_LOG_ERROR("%s: failed to decode, ret = %d\n", __func__, ret);
+     }
