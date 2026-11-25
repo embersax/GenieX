@@ -1,5 +1,5 @@
 diff --git a/ggml/src/ggml-hexagon/ggml-hexagon.cpp b/ggml/src/ggml-hexagon/ggml-hexagon.cpp
-index c38d0005c..40b1dcf1b 100644
+index c38d0005c..6b5f5caa8 100644
 --- a/ggml/src/ggml-hexagon/ggml-hexagon.cpp
 +++ b/ggml/src/ggml-hexagon/ggml-hexagon.cpp
 @@ -137,6 +137,14 @@ int    opt_fa_select     = 2; // 2 = HMX -> HVX -> CPU, 1 = HVX -> CPU, 0 = CPU
@@ -73,7 +73,7 @@ index c38d0005c..40b1dcf1b 100644
  
          return true;
      }
-@@ -2440,6 +2466,364 @@ static void ggml_hexagon_graph_repack(const ggml_cgraph * graph, ggml_hexagon_se
+@@ -2440,6 +2466,360 @@ static void ggml_hexagon_graph_repack(const ggml_cgraph * graph, ggml_hexagon_se
      }
  }
  
@@ -404,12 +404,8 @@ index c38d0005c..40b1dcf1b 100644
 +            }
 +        }
 +
-+        uint32_t n_hvx = std::min<uint32_t>(sess_n_hvx, (uint32_t) (C / HTP_SSM_DIRECT_SLICE));
-+        if (T > 1) {   // chunked prefill kernel: 32-aligned channel range per thread
-+            while (n_hvx > 1 && (C % (32 * n_hvx)) != 0) n_hvx--;
-+        }
-+        const uint64_t vtcm  = (uint64_t) n_hvx * (T > 1 ? htp_ssm_direct_vtcm_bytes_per_thread_prefill((uint32_t) T, (uint32_t) C, n_hvx)
-+                                                         : htp_ssm_direct_vtcm_bytes_per_thread((uint32_t) T));
++        const uint32_t n_hvx = std::min<uint32_t>(sess_n_hvx, (uint32_t) (C / HTP_SSM_DIRECT_SLICE));
++        const uint64_t vtcm  = (uint64_t) n_hvx * htp_ssm_direct_vtcm_bytes_per_thread((uint32_t) T);
 +        if (n_hvx == 0 || vtcm > sess_vtcm) { if (f.silu) folded[node_index(f.silu)] = 0; continue; }
 +
 +        f.x = x; f.old = old; f.w = w; f.n_hvx = n_hvx; f.vtcm = (uint32_t) vtcm;
@@ -438,7 +434,7 @@ index c38d0005c..40b1dcf1b 100644
  static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, ggml_cgraph * graph) {
      auto sess = static_cast<ggml_hexagon_session *>(backend->context);
  
-@@ -2462,9 +2846,17 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
+@@ -2462,9 +2842,17 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
  
          computed_nodes.reserve(graph->n_nodes);
  
@@ -457,7 +453,7 @@ index c38d0005c..40b1dcf1b 100644
                  continue;
              }
  
-@@ -2473,8 +2865,40 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
+@@ -2473,8 +2861,40 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
                  GGML_ABORT("\nggml-hex: graph-compute %s is not supported\n", ggml_op_desc(n));
              }
  
@@ -500,7 +496,7 @@ index c38d0005c..40b1dcf1b 100644
  
              computed_nodes.push_back(std::move(node));
          }
-@@ -3468,6 +3892,14 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
+@@ -3468,6 +3888,14 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
      const char * str_fa_split  = getenv("GGML_HEXAGON_FA_SPLIT");
      const char * str_li_select = getenv("GGML_HEXAGON_LI_SELECT");
      const char * str_gdn_select = getenv("GGML_HEXAGON_GDN_SELECT");
@@ -515,7 +511,7 @@ index c38d0005c..40b1dcf1b 100644
      const char * str_ar_select = getenv("GGML_HEXAGON_AR_SELECT");
      const char * str_ar_scatter = getenv("GGML_HEXAGON_AR_SCATTER");
      const char * str_ndev     = getenv("GGML_HEXAGON_NDEV");
-@@ -3535,6 +3967,14 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
+@@ -3535,6 +3963,14 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
      opt_fa_split  = str_fa_split  ? atoi(str_fa_split)                   : opt_fa_split;
      opt_li_select = str_li_select ? atoi(str_li_select)                   : opt_li_select;
      opt_gdn_select    = str_gdn_select    ? atoi(str_gdn_select)          : opt_gdn_select;
@@ -1874,7 +1870,7 @@ index ad457d1a6..d93645b35 100644
  
      vtcm_release(ctx);
 diff --git a/ggml/src/ggml-hexagon/htp/matmul-ops.c b/ggml/src/ggml-hexagon/htp/matmul-ops.c
-index fb15310cf..863d31fe1 100644
+index fb15310cf..25deba0e0 100644
 --- a/ggml/src/ggml-hexagon/htp/matmul-ops.c
 +++ b/ggml/src/ggml-hexagon/htp/matmul-ops.c
 @@ -248,6 +248,175 @@ static const uint8_t __attribute__((aligned(VLEN))) kvalues_mxfp4_lut[] = {
@@ -2376,32 +2372,46 @@ index fb15310cf..863d31fe1 100644
  static void transfer_output_chunk_scattered_threaded(
              struct htp_context *ctx,
              float *dst,
-@@ -3532,6 +3758,7 @@ static int hmx_mm_id_2d_f32(struct htp_context *ctx,
+@@ -3493,7 +3719,8 @@ static int hmx_mm_id_2d_f32(struct htp_context *ctx,
+                                          int mapping_stride,
+                                          int m_start,
+                                          int m_end,
+-                                         int n_hvx) {
++                                         int n_hvx,
++                                         int m1_mode) {   // x-elite port: 0 = staged gather (M1), 1 = stage + direct convert (diag), 2 = direct gather
+     struct htp_thread_trace * tr = &ctx->trace[0];
+     htp_trace_event_start(tr, HTP_TRACE_EVT_INIT, 0);
+ 
+@@ -3532,6 +3759,7 @@ static int hmx_mm_id_2d_f32(struct htp_context *ctx,
                                    &size_per_n, &size_per_m, &size_per_mn);
  
      const size_t overhead = htp_mm_hmx_get_2d_overhead(/*pipeline=*/false, /*is_matmul_id=*/true);
-+    size_per_m += (size_t) k * sizeof(float);   // x-elite port (M1): fp32 staging row for the DMA gather
++    if (m1_mode != 2) size_per_m += (size_t) k * sizeof(float);   // x-elite port (M1): fp32 staging row for the DMA gather
      size_t m_chunk_n_rows = 0, n_chunk_n_cols = 0;
      if (htp_mm_hmx_compute_chunks(vtcm_budget, overhead, size_per_n, size_per_m, size_per_mn,
                             m_core_padded, n,
-@@ -3553,6 +3780,7 @@ static int hmx_mm_id_2d_f32(struct htp_context *ctx,
+@@ -3553,6 +3781,7 @@ static int hmx_mm_id_2d_f32(struct htp_context *ctx,
      __fp16  *vtcm_output   = (__fp16 *) vtcm_seq_alloc(&vtcm_ptr, output_area_size);
      void    *vtcm_scratch0 = vtcm_seq_alloc(&vtcm_ptr, scratch0_size);
      __fp16  *vtcm_scales   = (__fp16 *) vtcm_seq_alloc(&vtcm_ptr, 256);
-+    float   *vtcm_stage    = (float *) vtcm_seq_alloc(&vtcm_ptr, hex_align_up(m_chunk_n_rows * (size_t) k * sizeof(float), 128));
++    float   *vtcm_stage    = (m1_mode != 2) ? (float *) vtcm_seq_alloc(&vtcm_ptr, hex_align_up(m_chunk_n_rows * (size_t) k * sizeof(float), 128)) : NULL;
  
      vtcm_used = vtcm_ptr - (uint8_t *) ctx->vtcm_base;
      if (vtcm_used > vtcm_budget) {
-@@ -3573,9 +3801,13 @@ static int hmx_mm_id_2d_f32(struct htp_context *ctx,
+@@ -3573,9 +3802,17 @@ static int hmx_mm_id_2d_f32(struct htp_context *ctx,
          const size_t n_rows = hex_smin((size_t) m_end - mr, m_chunk_n_rows);
          const size_t n_row_tiles = hmx_ceil_div(n_rows, HTP_MM_HMX_TILE_N_ROWS);
  
 -        transfer_activation_chunk_gathered_threaded(
 -            ctx, vtcm_f16_act, activation, (int) mr, (int) n_rows, k,
 -            matrix_rows, cur_a, mapping_stride, ne11, act_nb1, act_nb2, cne1, n_hvx, k_valid);
-+        if (!transfer_activation_chunk_staged_threaded(
++        bool staged_ok = false;
++        if (m1_mode != 2) {
++            staged_ok = transfer_activation_chunk_staged_threaded(
 +                ctx, weight_dma, vtcm_f16_act, vtcm_stage, activation, (int) mr, (int) n_rows, k,
-+                matrix_rows, cur_a, mapping_stride, ne11, act_nb1, act_nb2, cne1, n_hvx, k_valid)) {
++                matrix_rows, cur_a, mapping_stride, ne11, act_nb1, act_nb2, cne1, n_hvx, k_valid);
++        }
++        if (!staged_ok || m1_mode == 1) {
 +            transfer_activation_chunk_gathered_threaded(
 +                ctx, vtcm_f16_act, activation, (int) mr, (int) n_rows, k,
 +                matrix_rows, cur_a, mapping_stride, ne11, act_nb1, act_nb2, cne1, n_hvx, k_valid);
@@ -2409,7 +2419,7 @@ index fb15310cf..863d31fe1 100644
  
          // A0: Pre-fetch the first weight chunk (nc = 0)
          if (n > 0) {
-@@ -3756,6 +3988,159 @@ int op_matmul(struct htp_ops_context * octx) {
+@@ -3756,6 +3993,159 @@ int op_matmul(struct htp_ops_context * octx) {
      return op_matmul_impl(octx);
  }
  
@@ -2569,11 +2579,12 @@ index fb15310cf..863d31fe1 100644
  static int hmx_mm_op_matmul_id(
      struct htp_ops_context * octx,
      struct htp_mm_context * mmctx
-@@ -3767,6 +4152,15 @@ static int hmx_mm_op_matmul_id(
+@@ -3767,6 +4157,16 @@ static int hmx_mm_op_matmul_id(
      const int n_ids = octx->src[2]->ne[0];
      const int n_as  = ne02;
  
-+    if (octx->ctx->mdev.count == 1 && kparams->tile_size > 0) {   // x-elite port M2
++    const int m1_mode = kparams->mv_group;   // x-elite port: GGML_HEXAGON_MV_GROUP selects the MoE prefill variant
++    if (m1_mode == 3 && octx->ctx->mdev.count == 1 && kparams->tile_size > 0) {   // x-elite port M2
 +        const struct hmx_mmid_pipe_weight w0 = { (float *) dst->data, src0->data, nb02, nb1, nb2, (int) src0->nb[1], (int) src0->type };
 +        const int ret = hmx_mm_id_pipelined(octx->ctx, octx->ctx->dma[0], &w0, 1, (const float *) act->data, (int) ne00, (int) ne01,
 +                                            (int) ne11, nb11, nb12, matrix_rows, matrix_row_counts, n_as, mmctx->mapping_stride,
@@ -2585,11 +2596,21 @@ index fb15310cf..863d31fe1 100644
      const bool mdev_split = (octx->ctx->mdev.count > 1) && htp_tensor_can_row_partition(dst, sizeof(float));
      if (octx->ctx->mdev.count > 1 && !mdev_split && octx->ctx->mdev.idx > 0) {
          return HTP_STATUS_OK;
-@@ -3922,6 +4316,24 @@ static int hmx_mm_op_matmul_id_nx(
+@@ -3810,7 +4210,7 @@ static int hmx_mm_op_matmul_id(
+                                    (int) src0->nb[1], (int) src0->type,
+                                    kparams->tile_size, kparams->aligned_tile_size,
+                                    matrix_rows, cur_a, mmctx->mapping_stride,
+-                                   m_start, m_end, (int) octx->n_hvx);
++                                   m_start, m_end, (int) octx->n_hvx, m1_mode == 3 ? 0 : m1_mode);
+         if (ret != 0) {
+             FARF(ERROR, "HMX matmul failed for expert %u, error %d\n", cur_a, ret);
+             return HTP_STATUS_NO_SUPPORT;
+@@ -3922,6 +4322,25 @@ static int hmx_mm_op_matmul_id_nx(
      const struct htp_tensor * restrict act  = octx->src[n_weights];
      const int n_as = src0->ne[2];
  
-+    if (octx->ctx->mdev.count == 1 && kparams->tile_size > 0 && n_weights <= 4) {   // x-elite port M2
++    const int m1_mode = kparams->mv_group;
++    if (m1_mode == 3 && octx->ctx->mdev.count == 1 && kparams->tile_size > 0 && n_weights <= 4) {   // x-elite port M2
 +        struct hmx_mmid_pipe_weight ws[4]; uint32_t nw = 0; bool same = true;
 +        for (uint32_t p = 0; p < n_weights; ++p) {
 +            const struct htp_tensor * restrict src_w = octx->src[p];
@@ -2610,6 +2631,15 @@ index fb15310cf..863d31fe1 100644
      bool mdev_split = (octx->ctx->mdev.count > 1);
      for (uint32_t p = 0; p < n_weights && mdev_split; ++p) {
          const struct htp_tensor * restrict dst = octx->dsts[p];
+@@ -3974,7 +4393,7 @@ static int hmx_mm_op_matmul_id_nx(
+                                        (int) src_w->nb[1], (int) src_w->type,
+                                        kparams->tile_size, kparams->aligned_tile_size,
+                                        matrix_rows, cur_a, mmctx->mapping_stride,
+-                                       m_start, m_end, (int) octx->n_hvx);
++                                       m_start, m_end, (int) octx->n_hvx, m1_mode == 3 ? 0 : m1_mode);
+             if (ret != 0) {
+                 FARF(ERROR, "HMX matmul ID NX failed for expert %u weight %u, error %d\n", cur_a, p, ret);
+                 return HTP_STATUS_NO_SUPPORT;
 diff --git a/ggml/src/ggml-hexagon/htp/matmul-ops.h b/ggml/src/ggml-hexagon/htp/matmul-ops.h
 index 0c16fe7b8..ecac89285 100644
 --- a/ggml/src/ggml-hexagon/htp/matmul-ops.h
@@ -2796,7 +2826,7 @@ index 000000000..e23421e56
 +
 +#endif
 diff --git a/ggml/src/ggml-hexagon/htp/ssm-conv.c b/ggml/src/ggml-hexagon/htp/ssm-conv.c
-index d75304fef..b3d49ceeb 100644
+index d75304fef..55c838eaa 100644
 --- a/ggml/src/ggml-hexagon/htp/ssm-conv.c
 +++ b/ggml/src/ggml-hexagon/htp/ssm-conv.c
 @@ -20,6 +20,8 @@
@@ -2808,7 +2838,7 @@ index d75304fef..b3d49ceeb 100644
  
  struct htp_ssm_conv_context {
      struct htp_ops_context *                  octx;
-@@ -634,7 +636,297 @@ int op_ssm_conv_f32(struct htp_ops_context * octx) {
+@@ -634,7 +636,296 @@ int op_ssm_conv_f32(struct htp_ops_context * octx) {
      return HTP_STATUS_OK;
  }
  
@@ -3057,11 +3087,9 @@ index d75304fef..b3d49ceeb 100644
 +        return HTP_STATUS_CONV_NHVX;
 +    }
 +    const uint32_t n_hvx = octx->n_hvx;
-+    if (tokens > 1 && (n_hvx == 0 || (channels % (32 * n_hvx)) != 0)) {
-+        return HTP_STATUS_CONV_NHVX;
-+    }
-+    const uint32_t per_thread_bytes = (tokens > 1) ? htp_ssm_direct_vtcm_bytes_per_thread_prefill(tokens, channels, n_hvx)
-+                                                   : htp_ssm_direct_vtcm_bytes_per_thread(tokens);
++    // P2 (chunked prefill, ssm_direct_worker_chunked) is not text-exact on the X Elite (session 5) and gave no
++    // speed-up; every T uses the validated per-slice kernel.
++    const uint32_t per_thread_bytes = htp_ssm_direct_vtcm_bytes_per_thread(tokens);
 +    const uint64_t bytes = (uint64_t) per_thread_bytes * n_hvx;
 +    if (n_hvx == 0 || n_hvx > HTP_OP_MAX_NTHREADS || kp->vtcm_size != bytes) {
 +        return HTP_STATUS_CONV_VTCM;
@@ -3088,7 +3116,8 @@ index d75304fef..b3d49ceeb 100644
 +    }
 +    struct ssm_direct_task task = { .octx = octx, .channels = channels, .tokens = tokens, .silu = kp->silu,
 +                                    .per_thread_bytes = per_thread_bytes };
-+    work_queue_run(ctx->hvx_queue, (tokens > 1) ? ssm_direct_worker_chunked : ssm_direct_worker, &task, n_hvx);
++    work_queue_run(ctx->hvx_queue, ssm_direct_worker, &task, n_hvx);
++    (void) ssm_direct_worker_chunked;
 +    for (uint32_t i = 0; i < n_hvx; ++i) {
 +        if (task.failed[i]) return HTP_STATUS_INTERNAL_ERR;
 +    }
