@@ -82,7 +82,8 @@ llama_model_params build_model_params(const geniex_ModelConfig& config, Device d
     if (!s_tensor_overrides.empty()) {
         s_tensor_overrides.push_back({nullptr, nullptr});
         mpar.tensor_buft_overrides = s_tensor_overrides.data();
-        GENIEX_LOG_INFO("[Optimise] tensor overrides: {} MoE expert pattern(s) pinned to the CPU", s_tensor_overrides.size() - 1);
+        GENIEX_LOG_INFO(
+            "[Optimise] tensor overrides: {} MoE expert pattern(s) pinned to the CPU", s_tensor_overrides.size() - 1);
     }
     GENIEX_LOG_INFO("[Optimise] model params: n_gpu_layers={}, load_mode={}",
         mpar.n_gpu_layers,
@@ -154,8 +155,8 @@ llama_context_params build_context_params(const geniex_ModelConfig& config, int3
     if (const char* env_tb = std::getenv("GENIEX_LLAMA_THREADS_BATCH"); env_tb && std::atoi(env_tb) > 0) {
         cpar.n_threads_batch = std::atoi(env_tb);
     }
-    cpar.flash_attn_type      = static_cast<llama_flash_attn_type>(fa);
-    cpar.no_perf              = false;
+    cpar.flash_attn_type = static_cast<llama_flash_attn_type>(fa);
+    cpar.no_perf         = false;
 
     if (spec) {
         cpar.n_rs_seq     = spec->need_n_rs_seq();
