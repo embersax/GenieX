@@ -1915,7 +1915,7 @@ index ad457d1a6..d93645b35 100644
  
      vtcm_release(ctx);
 diff --git a/ggml/src/ggml-hexagon/htp/matmul-ops.c b/ggml/src/ggml-hexagon/htp/matmul-ops.c
-index fb15310cf..203e4ef95 100644
+index fb15310cf..991fdfd17 100644
 --- a/ggml/src/ggml-hexagon/htp/matmul-ops.c
 +++ b/ggml/src/ggml-hexagon/htp/matmul-ops.c
 @@ -248,6 +248,175 @@ static const uint8_t __attribute__((aligned(VLEN))) kvalues_mxfp4_lut[] = {
@@ -2587,7 +2587,7 @@ index fb15310cf..203e4ef95 100644
      return 0;
  }
  
-@@ -3756,6 +4078,159 @@ int op_matmul(struct htp_ops_context * octx) {
+@@ -3756,6 +4078,163 @@ int op_matmul(struct htp_ops_context * octx) {
      return op_matmul_impl(octx);
  }
  
@@ -2695,16 +2695,20 @@ index fb15310cf..203e4ef95 100644
 +
 +    hmx_matmul_job_t jobs[2];
 +    struct unit prev = cur; bool have_prev = false;
++    uint32_t n_chunks_started = 0, aslot = 0;   // x-elite port (M3): act16 slot of the current m-chunk
 +    for (uint32_t u = 0; cur.a < n_as; ++u) {
 +        const uint32_t par = u & 1;
 +        dma_queue_flush(dma_q);   // stage rows (if any) + raw weights of this unit
-+        {
-+            // the m-chunk's rows were staged when its first weight (p == 0) was unit u - p, parity (u - p) & 1;
-+            // every weight of the chunk converts them again into its own act16[par] (cheap: VTCM -> VTCM)
++        if (cur.p == 0) {
++            // x-elite port (M3): the m-chunk's rows are converted once, into act16[chunk parity], and every weight of
++            // the chunk reads that slot (the session-6 trace showed the per-weight re-convert doubling A_PREP). The
++            // slot alternates per chunk, so the last HMX reader of a slot (the previous chunk's last weight) has been
++            // popped (at the first unit of the following chunk) before the slot is written again.
++            aslot = (n_chunks_started++) & 1;
 +            int chunks_per_hvx = hex_align_up(hmx_ceil_div(cur.n_rows, n_hvx), 2);
 +            int actual_hvx = hmx_ceil_div(cur.n_rows, chunks_per_hvx);
 +            activation_transfer_staged_task_state_t st = {
-+                .dst = act16[par], .stage = stage[(u - cur.p) & 1], .n_tasks = actual_hvx,
++                .dst = act16[aslot], .stage = stage[u & 1], .n_tasks = actual_hvx,
 +                .n_chunks_per_task = chunks_per_hvx, .n_rows = (uint32_t) cur.n_rows, .n_rows_valid = (uint32_t) cur.n_valid,
 +                .k_block = (uint32_t) k, .k_valid = (uint32_t) k,
 +            };
@@ -2725,7 +2729,7 @@ index fb15310cf..203e4ef95 100644
 +                                                     matrix_rows, prev.a, mapping_stride, ws[prev.p].dst_nb1, ws[prev.p].dst_nb2,
 +                                                     (int) matrix_row_counts[prev.a], n_hvx);
 +        }
-+        hmx_matmul_job_init(&jobs[par], out16[par], act16[par], w16[par], scales,
++        hmx_matmul_job_init(&jobs[par], out16[par], act16[aslot], w16[par], scales,
 +                            hmx_ceil_div(cur.n_rows, HTP_MM_HMX_TILE_N_ROWS), (uint32_t) n_col_tiles, k / HTP_MM_HMX_TILE_N_ROWS);
 +        hmx_queue_push(ctx->hmx_queue, hmx_queue_make_desc(hmx_matmul_worker_fn, &jobs[par]));
 +        prev = cur; have_prev = true;
@@ -2747,7 +2751,7 @@ index fb15310cf..203e4ef95 100644
  static int hmx_mm_op_matmul_id(
      struct htp_ops_context * octx,
      struct htp_mm_context * mmctx
-@@ -3767,6 +4242,16 @@ static int hmx_mm_op_matmul_id(
+@@ -3767,6 +4246,16 @@ static int hmx_mm_op_matmul_id(
      const int n_ids = octx->src[2]->ne[0];
      const int n_as  = ne02;
  
@@ -2764,7 +2768,7 @@ index fb15310cf..203e4ef95 100644
      const bool mdev_split = (octx->ctx->mdev.count > 1) && htp_tensor_can_row_partition(dst, sizeof(float));
      if (octx->ctx->mdev.count > 1 && !mdev_split && octx->ctx->mdev.idx > 0) {
          return HTP_STATUS_OK;
-@@ -3779,6 +4264,7 @@ static int hmx_mm_op_matmul_id(
+@@ -3779,6 +4268,7 @@ static int hmx_mm_op_matmul_id(
      }
      const bool expert_split = mdev_split && (n_active >= octx->ctx->mdev.count);
  
@@ -2772,7 +2776,7 @@ index fb15310cf..203e4ef95 100644
      uint32_t target_dev = 0;
      for (uint32_t cur_a = 0; cur_a < (uint32_t) n_as; ++cur_a) {
          const int32_t cne1 = matrix_row_counts[cur_a];
-@@ -3810,7 +4296,8 @@ static int hmx_mm_op_matmul_id(
+@@ -3810,7 +4300,8 @@ static int hmx_mm_op_matmul_id(
                                     (int) src0->nb[1], (int) src0->type,
                                     kparams->tile_size, kparams->aligned_tile_size,
                                     matrix_rows, cur_a, mmctx->mapping_stride,
@@ -2782,7 +2786,7 @@ index fb15310cf..203e4ef95 100644
          if (ret != 0) {
              FARF(ERROR, "HMX matmul failed for expert %u, error %d\n", cur_a, ret);
              return HTP_STATUS_NO_SUPPORT;
-@@ -3922,6 +4409,25 @@ static int hmx_mm_op_matmul_id_nx(
+@@ -3922,6 +4413,25 @@ static int hmx_mm_op_matmul_id_nx(
      const struct htp_tensor * restrict act  = octx->src[n_weights];
      const int n_as = src0->ne[2];
  
@@ -2808,7 +2812,7 @@ index fb15310cf..203e4ef95 100644
      bool mdev_split = (octx->ctx->mdev.count > 1);
      for (uint32_t p = 0; p < n_weights && mdev_split; ++p) {
          const struct htp_tensor * restrict dst = octx->dsts[p];
-@@ -3938,6 +4444,7 @@ static int hmx_mm_op_matmul_id_nx(
+@@ -3938,6 +4448,7 @@ static int hmx_mm_op_matmul_id_nx(
      }
      const bool expert_split = mdev_split && (n_active >= octx->ctx->mdev.count);
  
@@ -2816,7 +2820,7 @@ index fb15310cf..203e4ef95 100644
      uint32_t target_dev = 0;
      for (uint32_t cur_a = 0; cur_a < (uint32_t) n_as; ++cur_a) {
          const int32_t cne1 = matrix_row_counts[cur_a];
-@@ -3959,6 +4466,7 @@ static int hmx_mm_op_matmul_id_nx(
+@@ -3959,6 +4470,7 @@ static int hmx_mm_op_matmul_id_nx(
          }
          if (m_start >= m_end) continue;
  
@@ -2824,7 +2828,7 @@ index fb15310cf..203e4ef95 100644
          for (uint32_t p = 0; p < n_weights; ++p) {
              const struct htp_tensor * restrict src_w = octx->src[p];
              const struct htp_tensor * restrict dst   = octx->dsts[p];
-@@ -3974,7 +4482,9 @@ static int hmx_mm_op_matmul_id_nx(
+@@ -3974,7 +4486,9 @@ static int hmx_mm_op_matmul_id_nx(
                                         (int) src_w->nb[1], (int) src_w->type,
                                         kparams->tile_size, kparams->aligned_tile_size,
                                         matrix_rows, cur_a, mmctx->mapping_stride,
