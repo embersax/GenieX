@@ -1915,7 +1915,7 @@ index ad457d1a6..d93645b35 100644
  
      vtcm_release(ctx);
 diff --git a/ggml/src/ggml-hexagon/htp/matmul-ops.c b/ggml/src/ggml-hexagon/htp/matmul-ops.c
-index fb15310cf..991fdfd17 100644
+index fb15310cf..6fa999a81 100644
 --- a/ggml/src/ggml-hexagon/htp/matmul-ops.c
 +++ b/ggml/src/ggml-hexagon/htp/matmul-ops.c
 @@ -248,6 +248,175 @@ static const uint8_t __attribute__((aligned(VLEN))) kvalues_mxfp4_lut[] = {
@@ -2587,7 +2587,7 @@ index fb15310cf..991fdfd17 100644
      return 0;
  }
  
-@@ -3756,6 +4078,163 @@ int op_matmul(struct htp_ops_context * octx) {
+@@ -3756,6 +4078,164 @@ int op_matmul(struct htp_ops_context * octx) {
      return op_matmul_impl(octx);
  }
  
@@ -2627,7 +2627,7 @@ index fb15310cf..991fdfd17 100644
 +    // VTCM: raw + 2 x fp16 weights + 2 x (act + out + stage) rows + scales
 +    const size_t raw_size = hex_align_up(n_col_tiles * (size_t) n_weight_tiles * (size_t) aligned_tile_size, HTP_MM_HMX_TILE_SIZE);
 +    const size_t w16_size = hex_align_up((size_t) n * k * sizeof(__fp16), HTP_MM_HMX_TILE_SIZE);
-+    const size_t fixed    = raw_size + 2 * w16_size + 512;
++    const size_t fixed    = 2 * raw_size + 2 * w16_size + 512;   // x-elite port (M4): raw double-buffered
 +    if (fixed >= ctx->vtcm_size) return -2;
 +    const size_t per_row  = 2 * ((size_t) k * sizeof(__fp16) + (size_t) n * sizeof(__fp16) + (size_t) k * sizeof(float));
 +    size_t m_chunk = (ctx->vtcm_size - fixed) / per_row;
@@ -2639,7 +2639,7 @@ index fb15310cf..991fdfd17 100644
 +    const size_t stage_size = hex_align_up(m_chunk * (size_t) k * sizeof(float), 128);
 +
 +    uint8_t * vp = (uint8_t *) ctx->vtcm_base;
-+    uint8_t * raw      = (uint8_t *) vtcm_seq_alloc(&vp, raw_size);
++    uint8_t * raw[2]   = { (uint8_t *) vtcm_seq_alloc(&vp, raw_size), (uint8_t *) vtcm_seq_alloc(&vp, raw_size) };
 +    __fp16 *  w16[2]   = { (__fp16 *) vtcm_seq_alloc(&vp, w16_size), (__fp16 *) vtcm_seq_alloc(&vp, w16_size) };
 +    __fp16 *  act16[2] = { (__fp16 *) vtcm_seq_alloc(&vp, act_size), (__fp16 *) vtcm_seq_alloc(&vp, act_size) };
 +    __fp16 *  out16[2] = { (__fp16 *) vtcm_seq_alloc(&vp, out_size), (__fp16 *) vtcm_seq_alloc(&vp, out_size) };
@@ -2684,7 +2684,7 @@ index fb15310cf..991fdfd17 100644
 +                                        act_row_bytes, act_row_bytes, act_row_bytes, 1)) return -1;                 \
 +                }                                                                                                    \
 +            }                                                                                                        \
-+            if (!dma_queue_push(dma_q, dma_make_data(raw, ws[(u).p].weight + (dma_addr_t) (u).a * ws[(u).p].weight_nb2), \
++            if (!dma_queue_push(dma_q, dma_make_data(raw[(par)], ws[(u).p].weight + (dma_addr_t) (u).a * ws[(u).p].weight_nb2), \
 +                                aligned_tile_size, tile_size, tile_size, raw_height)) return -1;                     \
 +        } while (0)
 +
@@ -2714,15 +2714,16 @@ index fb15310cf..991fdfd17 100644
 +            };
 +            work_queue_run(ctx->hvx_queue, transfer_activation_chunk_staged_worker_fn, &st, actual_hvx);
 +        }
-+        dequantize_tiled_weight_chunk_to_fp16_tiles(ctx, w16[par], raw, n, k, row_stride, weight_type,
-+                                                    n_k_tiles, n_k_tiles_div, dequant_fn, n_hvx);
-+        // next unit's DMAs (raw is free again; its stage rows go to the other parity only when a new m-chunk starts)
++        // x-elite port (M4): the next unit's DMAs (raw[par ^ 1] and, for a new m-chunk, stage[(u + 1) & 1]) are pushed
++        // BEFORE this unit's dequant so the weight transfer streams under the HVX work instead of only under HMX + scatter
 +        struct unit nxt = cur; PIPE_ADVANCE(nxt);
 +        if (nxt.a < n_as) {
 +            // a new m-chunk (p == 0) stages into parity (u + 1) & 1: that stage buffer was last used by the chunk
 +            // started at unit u - 1 (p == 0 there), whose conversions are all done by now when n_weights <= 2
 +            PIPE_PUSH(nxt, (u + 1) & 1);
 +        }
++        dequantize_tiled_weight_chunk_to_fp16_tiles(ctx, w16[par], raw[par], n, k, row_stride, weight_type,
++                                                    n_k_tiles, n_k_tiles_div, dequant_fn, n_hvx);
 +        if (have_prev) {
 +            hmx_queue_pop(ctx->hmx_queue);
 +            transfer_output_chunk_scattered_threaded(ctx, ws[prev.p].dst, out16[par ^ 1], prev.mr, prev.n_rows, n,
@@ -2751,7 +2752,7 @@ index fb15310cf..991fdfd17 100644
  static int hmx_mm_op_matmul_id(
      struct htp_ops_context * octx,
      struct htp_mm_context * mmctx
-@@ -3767,6 +4246,16 @@ static int hmx_mm_op_matmul_id(
+@@ -3767,6 +4247,16 @@ static int hmx_mm_op_matmul_id(
      const int n_ids = octx->src[2]->ne[0];
      const int n_as  = ne02;
  
@@ -2768,7 +2769,7 @@ index fb15310cf..991fdfd17 100644
      const bool mdev_split = (octx->ctx->mdev.count > 1) && htp_tensor_can_row_partition(dst, sizeof(float));
      if (octx->ctx->mdev.count > 1 && !mdev_split && octx->ctx->mdev.idx > 0) {
          return HTP_STATUS_OK;
-@@ -3779,6 +4268,7 @@ static int hmx_mm_op_matmul_id(
+@@ -3779,6 +4269,7 @@ static int hmx_mm_op_matmul_id(
      }
      const bool expert_split = mdev_split && (n_active >= octx->ctx->mdev.count);
  
@@ -2776,7 +2777,7 @@ index fb15310cf..991fdfd17 100644
      uint32_t target_dev = 0;
      for (uint32_t cur_a = 0; cur_a < (uint32_t) n_as; ++cur_a) {
          const int32_t cne1 = matrix_row_counts[cur_a];
-@@ -3810,7 +4300,8 @@ static int hmx_mm_op_matmul_id(
+@@ -3810,7 +4301,8 @@ static int hmx_mm_op_matmul_id(
                                     (int) src0->nb[1], (int) src0->type,
                                     kparams->tile_size, kparams->aligned_tile_size,
                                     matrix_rows, cur_a, mmctx->mapping_stride,
@@ -2786,7 +2787,7 @@ index fb15310cf..991fdfd17 100644
          if (ret != 0) {
              FARF(ERROR, "HMX matmul failed for expert %u, error %d\n", cur_a, ret);
              return HTP_STATUS_NO_SUPPORT;
-@@ -3922,6 +4413,25 @@ static int hmx_mm_op_matmul_id_nx(
+@@ -3922,6 +4414,25 @@ static int hmx_mm_op_matmul_id_nx(
      const struct htp_tensor * restrict act  = octx->src[n_weights];
      const int n_as = src0->ne[2];
  
@@ -2812,7 +2813,7 @@ index fb15310cf..991fdfd17 100644
      bool mdev_split = (octx->ctx->mdev.count > 1);
      for (uint32_t p = 0; p < n_weights && mdev_split; ++p) {
          const struct htp_tensor * restrict dst = octx->dsts[p];
-@@ -3938,6 +4448,7 @@ static int hmx_mm_op_matmul_id_nx(
+@@ -3938,6 +4449,7 @@ static int hmx_mm_op_matmul_id_nx(
      }
      const bool expert_split = mdev_split && (n_active >= octx->ctx->mdev.count);
  
@@ -2820,7 +2821,7 @@ index fb15310cf..991fdfd17 100644
      uint32_t target_dev = 0;
      for (uint32_t cur_a = 0; cur_a < (uint32_t) n_as; ++cur_a) {
          const int32_t cne1 = matrix_row_counts[cur_a];
-@@ -3959,6 +4470,7 @@ static int hmx_mm_op_matmul_id_nx(
+@@ -3959,6 +4471,7 @@ static int hmx_mm_op_matmul_id_nx(
          }
          if (m_start >= m_end) continue;
  
@@ -2828,7 +2829,7 @@ index fb15310cf..991fdfd17 100644
          for (uint32_t p = 0; p < n_weights; ++p) {
              const struct htp_tensor * restrict src_w = octx->src[p];
              const struct htp_tensor * restrict dst   = octx->dsts[p];
-@@ -3974,7 +4486,9 @@ static int hmx_mm_op_matmul_id_nx(
+@@ -3974,7 +4487,9 @@ static int hmx_mm_op_matmul_id_nx(
                                         (int) src_w->nb[1], (int) src_w->type,
                                         kparams->tile_size, kparams->aligned_tile_size,
                                         matrix_rows, cur_a, mmctx->mapping_stride,
